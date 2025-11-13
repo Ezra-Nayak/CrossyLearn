@@ -12,10 +12,8 @@ from enum import Enum
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import math
 
-class GameState(Enum):
-    MENU = 1
-    PLAYING = 2
 
 # --- DEEP LEARNING SETUP & MODEL ARCHITECTURE ---
 
@@ -35,82 +33,54 @@ DEVICE = setup_device()
 
 
 def preprocess_frame(frame):
-    """
-    Preprocesses a game frame for the DQN.
-    Converts to grayscale, resizes, and formats as a PyTorch tensor.
-    """
-    if frame is None:
-        return None
-    # Convert to grayscale
+    """Preprocesses a game frame for the DQN."""
+    if frame is None: return None
     gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    # Resize to 84x84
     resized_frame = cv2.resize(gray_frame, (84, 84), interpolation=cv2.INTER_AREA)
-    # Add channel dimension, convert to tensor, normalize, and send to device
     tensor_frame = torch.from_numpy(resized_frame).unsqueeze(0).unsqueeze(0).float().to(DEVICE) / 255.0
     return tensor_frame
 
 
 class ResidualBlock(nn.Module):
-    """ResNet-style residual block."""
-
     def __init__(self, in_channels):
         super(ResidualBlock, self).__init__()
         self.conv1 = nn.Conv2d(in_channels, in_channels, kernel_size=3, stride=1, padding=1)
         self.relu = nn.ReLU()
 
     def forward(self, x):
-        identity = x
-        out = self.relu(self.conv1(x))
-        out = self.conv1(out)  # Second conv
-        out += identity  # Skip connection
+        identity = x;
+        out = self.relu(self.conv1(x));
+        out = self.conv1(out)
+        out += identity;
         return self.relu(out)
 
 
 class DuelingDQN(nn.Module):
-    """SOTA Dueling DQN with a ResNet backbone."""
-
     def __init__(self, num_actions):
         super(DuelingDQN, self).__init__()
-        # Initial convolution layers
         self.conv1 = nn.Conv2d(1, 32, kernel_size=8, stride=4)
         self.conv2 = nn.Conv2d(32, 64, kernel_size=4, stride=2)
         self.conv3 = nn.Conv2d(64, 64, kernel_size=3, stride=1)
-
-        # ResNet blocks
-        self.res1 = ResidualBlock(64)
+        self.res1 = ResidualBlock(64);
         self.res2 = ResidualBlock(64)
-
-        # Dueling streams
-        # Value stream
-        self.value_fc = nn.Linear(7 * 7 * 64, 512)
+        self.value_fc = nn.Linear(7 * 7 * 64, 512);
         self.value_output = nn.Linear(512, 1)
-
-        # Advantage stream
-        self.advantage_fc = nn.Linear(7 * 7 * 64, 512)
+        self.advantage_fc = nn.Linear(7 * 7 * 64, 512);
         self.advantage_output = nn.Linear(512, num_actions)
-
         self.relu = nn.ReLU()
 
     def forward(self, x):
-        x = self.relu(self.conv1(x))
-        x = self.relu(self.conv2(x))
+        x = self.relu(self.conv1(x));
+        x = self.relu(self.conv2(x));
         x = self.relu(self.conv3(x))
-
-        x = self.res1(x)
-        x = self.res2(x)
-
-        x = x.view(x.size(0), -1)  # Flatten
-
-        # Value stream
-        value = self.relu(self.value_fc(x))
+        x = self.res1(x);
+        x = self.res2(x);
+        x = x.view(x.size(0), -1)
+        value = self.relu(self.value_fc(x));
         value = self.value_output(value)
-
-        # Advantage stream
-        advantage = self.relu(self.advantage_fc(x))
+        advantage = self.relu(self.advantage_fc(x));
         advantage = self.advantage_output(advantage)
-
-        # Combine streams
-        q_values = value + (advantage - advantage.mean(dim=1, keepdim=True))
+        q_values = value + (advantage - advantage.mean(dim=1, keepdim=True));
         return q_values
 
 
@@ -118,36 +88,24 @@ class DuelingDQN(nn.Module):
 
 class Agent:
     def __init__(self):
-        self.actions = ['up', 'left', 'right', 'down']
+        self.actions = ['up', 'left', 'right', 'down'];
         self.num_actions = len(self.actions)
-
-        # Create the policy and target networks
         self.policy_net = DuelingDQN(self.num_actions).to(DEVICE)
         self.target_net = DuelingDQN(self.num_actions).to(DEVICE)
-        self.target_net.load_state_dict(self.policy_net.state_dict())
-        self.target_net.eval()  # Target network is only for inference
-
-        self.last_action_time = 0
-        self.action_interval = 0.5
+        self.target_net.load_state_dict(self.policy_net.state_dict());
+        self.target_net.eval()
+        self.last_action_time = 0;
+        self.action_interval = 0.5;
         self.is_first_move = True
 
     def on_new_game(self):
-        print("Agent acknowledging new game. Cooldown initiated.")
+        print("Agent acknowledging new game. Cooldown initiated.");
         self.is_first_move = True
         self.last_action_time = time.time() + 2.5
 
     def choose_action(self, state_tensor, is_first_move):
-        """
-        Epsilon-Greedy action selection.
-        For now, we will just use full exploration (random actions).
-        """
-        # --- THIS IS WHERE THE BRAIN IS USED ---
         with torch.no_grad():
-            # Pass the current state through the network to get Q-values
             q_values = self.policy_net(state_tensor)
-
-        # For this milestone, we ignore the network's output and act randomly
-        # to confirm the whole loop works before adding training complexity.
         if is_first_move:
             return random.choice(['up', 'right', 'down'])
         else:
@@ -155,33 +113,29 @@ class Agent:
 
     def act(self, game_state, hwnd, current_frame):
         current_time = time.time()
-
         if game_state == GameState.MENU:
             if current_time - self.last_action_time > 2.0:
-                print("Agent is starting a new game...")
+                print("Agent is starting a new game...");
                 self.dispatch_action(hwnd, 'space')
                 self.last_action_time = current_time
-
         elif game_state == GameState.PLAYING:
             if current_time - self.last_action_time > self.action_interval:
                 processed_frame = preprocess_frame(current_frame)
                 if processed_frame is not None:
-                    print(f"[INFO] Preprocessed frame for network. Shape: {list(processed_frame.shape)}")
                     action = self.choose_action(processed_frame, self.is_first_move)
-                    print(f"Agent chose action: {action}")
+                    print(f"Agent chose action: {action}");
                     self.dispatch_action(hwnd, action)
                     self.last_action_time = current_time
-                    if self.is_first_move:
-                        self.is_first_move = False
+                    if self.is_first_move: self.is_first_move = False
 
     def dispatch_action(self, hwnd, action):
         if hwnd:
-            action_thread = threading.Thread(target=send_key, args=(hwnd, action))
+            action_thread = threading.Thread(target=send_key, args=(hwnd, action));
             action_thread.start()
 
 
 # --- VISION & CONTROL FUNCTIONS ---
-# (These functions remain unchanged from the previous version)
+
 def load_digit_templates():
     templates = {};
     template_dir = 'templates'
@@ -189,7 +143,7 @@ def load_digit_templates():
     for i in range(10):
         filepath = os.path.join(template_dir, f"{i}.png")
         if os.path.exists(filepath): templates[i] = cv2.imread(filepath, 0)
-    print(f"Loaded {len(templates)} digit templates.")
+    print(f"Loaded {len(templates)} digit templates.");
     return templates
 
 
@@ -212,7 +166,7 @@ def recognize_score(image, templates):
         best_match_score, best_match_digit = -1, -1
         for digit_val, template in templates.items():
             h_t, w_t = template.shape;
-            h_s, w_s = standardized_digit.shape
+            h_s, w_s = standardized_digit.shape;
             max_w = max(w_t, w_s)
             padded_template = np.zeros((TEMPLATE_HEIGHT, max_w), dtype=np.uint8)
             padded_digit = np.zeros((TEMPLATE_HEIGHT, max_w), dtype=np.uint8)
@@ -249,24 +203,48 @@ def send_key(hwnd, key):
         pydirectinput.press(key);
         time.sleep(0.1)
     except win32ui.error:
-        print("Error: Could not set foreground window.")
         pass
 
 
-# --- BACKGROUND VISION THREAD ---
+# --- BACKGROUND VISION THREAD (UPGRADED) ---
+
 class VisionThread(threading.Thread):
     def __init__(self, window_title):
         super().__init__();
         self.daemon = True;
         self.window_title = window_title
+        # Load templates
         self.digit_templates = load_digit_templates()
         self.retry_template = cv2.imread('templates/retry_button.png')
         if self.retry_template is None: raise FileNotFoundError("Could not load 'templates/retry_button.png'")
-        self.lock = threading.Lock();
+
+        # --- Final Tuned Parameters ---
+        self.LOWER_BOUND = np.array([118, 0, 0])
+        self.UPPER_BOUND = np.array([119, 255, 255])
+        self.AREA_MIN = 1481
+        self.AREA_MAX = 5000
+        self.SEARCH_ZONE_Y_INTERCEPT = 700
+        self.PENALTY_LINE_Y_INTERCEPT = 1285
+        self.LINE_ANGLE_DEG = 15
+
+        # Shared data
+        self.lock = threading.Lock()
         self.latest_frame = None;
         self.latest_score = None
         self.is_dead = False;
+        self.in_penalty_zone = False;
         self.running = True
+
+    def find_chicken(self, frame):
+        hsv_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        mask = cv2.inRange(hsv_frame, self.LOWER_BOUND, self.UPPER_BOUND)
+        contours, _ = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours: return None
+        valid_contours = [c for c in contours if self.AREA_MIN < cv2.contourArea(c) < self.AREA_MAX]
+        if not valid_contours: return None
+        chicken_contour = max(valid_contours, key=cv2.contourArea)
+        x, y, w, h = cv2.boundingRect(chicken_contour)
+        return (x + w // 2, y + h)
 
     def run(self):
         with mss.mss() as sct:
@@ -280,15 +258,43 @@ class VisionThread(threading.Thread):
                     TITLE_BAR_HEIGHT = 50
                     monitor = {"top": client_top + TITLE_BAR_HEIGHT, "left": client_left,
                                "width": client_right - client_left,
-                               "height": (client_bottom - client_top) - TITLE_BAR_HEIGHT}
+                               "height": client_bottom - client_top - TITLE_BAR_HEIGHT}
                     if monitor['width'] <= 0 or monitor['height'] <= 0: time.sleep(0.1); continue
+
                     game_frame = cv2.cvtColor(np.array(sct.grab(monitor)), cv2.COLOR_BGRA2BGR)
+                    frame_h, frame_w, _ = game_frame.shape
+
+                    # --- Full Perception Pipeline ---
                     score_val = recognize_score(game_frame.copy(), self.digit_templates)
                     death_detected = detect_retry_button(game_frame.copy(), self.retry_template)
+
+                    # Angled Search Zone Mask
+                    angle_rad = math.radians(self.LINE_ANGLE_DEG);
+                    slope = math.tan(angle_rad)
+                    search_y1 = self.SEARCH_ZONE_Y_INTERCEPT
+                    search_y2 = int(slope * frame_w + search_y1)
+                    search_mask = np.zeros(game_frame.shape[:2], dtype=np.uint8)
+                    pts = np.array([[0, search_y1], [frame_w, search_y2], [frame_w, frame_h], [0, frame_h]],
+                                   dtype=np.int32)
+                    cv2.fillPoly(search_mask, [pts], 255)
+                    search_area = cv2.bitwise_and(game_frame, game_frame, mask=search_mask)
+
+                    chicken_pos = self.find_chicken(search_area)
+
+                    penalty_detected = False
+                    if chicken_pos:
+                        cx, cy = chicken_pos
+                        # Adjust cy back to full frame coordinates
+                        cy_full_frame = cy + self.SEARCH_ZONE_Y_INTERCEPT
+                        penalty_line_y = int(slope * cx + self.PENALTY_LINE_Y_INTERCEPT)
+                        if cy_full_frame > penalty_line_y:
+                            penalty_detected = True
+
                     with self.lock:
                         self.latest_frame = game_frame;
-                        self.latest_score = score_val;
-                        self.is_dead = death_detected
+                        self.latest_score = score_val
+                        self.is_dead = death_detected;
+                        self.in_penalty_zone = penalty_detected
                 except Exception as e:
                     print(f"Error in Vision Thread: {e}");
                     time.sleep(1)
@@ -298,27 +304,37 @@ class VisionThread(threading.Thread):
 
 
 # --- MAIN APPLICATION LOOP ---
+class GameState(Enum):
+    MENU = 1;
+    PLAYING = 2
+
+
 def main():
     WINDOW_TITLE = "Crossy Road";
     TARGET_FPS = 60;
     FRAME_DELAY = 1.0 / TARGET_FPS
-    print("CrossyLearn Agent - Milestone 15: SOTA DQN Architecture")
-    print("-------------------------------------------------------")
+    print("CrossyLearn Agent - Milestone 19: Final Perception System")
+    print("---------------------------------------------------------")
     vision_thread = VisionThread(WINDOW_TITLE);
     vision_thread.start()
     agent = Agent();
     game_state = GameState.MENU;
     last_score = 0;
     high_score = 0
+    penalty_timer = 0;
+    PENALTY_INTERVAL = 1.0  # seconds
+
     while True:
         loop_start_time = time.time()
         with vision_thread.lock:
             frame = vision_thread.latest_frame;
-            score_str = vision_thread.latest_score;
-            is_dead = vision_thread.is_dead
-        if frame is None: print("Waiting for first frame..."); time.sleep(0.5); continue
-        current_score = int(score_str) if score_str is not None and score_str.isdigit() else None
+            score_str = vision_thread.latest_score
+            is_dead = vision_thread.is_dead;
+            in_penalty_zone = vision_thread.in_penalty_zone
 
+        if frame is None: print("Waiting for first frame..."); time.sleep(0.5); continue
+
+        current_score = int(score_str) if score_str is not None and score_str.isdigit() else None
         hwnd = win32gui.FindWindow(None, WINDOW_TITLE)
         agent.act(game_state, hwnd, frame)
 
@@ -331,18 +347,26 @@ def main():
                 agent.on_new_game()
         elif game_state == GameState.PLAYING:
             if is_dead:
-                punishment = -100
-                print(f"EVENT: Player has died! Score was {last_score}. Punishment: {punishment}")
+                print(f"EVENT: Player has died! Score was {last_score}. Punishment: -100")
                 game_state = GameState.MENU;
                 print("STATE CHANGE: PLAYING -> MENU")
+                penalty_timer = 0  # Reset timer on death
             elif current_score is not None and current_score > last_score:
-                shaping_reward = 1;
-                print(f"EVENT: Score increased to {current_score}! Reward: +{shaping_reward}")
+                print(f"EVENT: Score increased to {current_score}! Reward: +1")
                 if current_score > high_score:
-                    jackpot_reward = 100;
-                    print(f"EVENT: New high score! Jackpot Reward: +{jackpot_reward}")
+                    print(f"EVENT: New high score! Jackpot Reward: +100");
                     high_score = current_score
                 last_score = current_score
+
+            # Penalty Zone Logic
+            if in_penalty_zone:
+                if penalty_timer == 0:
+                    penalty_timer = time.time()
+                elif time.time() - penalty_timer > PENALTY_INTERVAL:
+                    print(f"EVENT: In penalty zone! Punishment: -10");
+                    penalty_timer = time.time()
+            else:
+                penalty_timer = 0  # Reset timer if safe
 
         display_frame = frame.copy();
         font = cv2.FONT_HERSHEY_SIMPLEX
@@ -357,6 +381,7 @@ def main():
         elapsed_time = time.time() - loop_start_time
         sleep_duration = FRAME_DELAY - elapsed_time
         if sleep_duration > 0: time.sleep(sleep_duration)
+
     print("Shutting down...");
     vision_thread.stop();
     vision_thread.join();

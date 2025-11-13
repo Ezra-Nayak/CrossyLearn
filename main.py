@@ -115,8 +115,11 @@ class Agent:
         current_time = time.time()
         if game_state == GameState.MENU:
             if current_time - self.last_action_time > 2.0:
-                print("Agent is starting a new game...");
-                self.dispatch_action(hwnd, 'space')
+                print("Agent is starting a new game via click...");
+                # ROI from detect_retry_button: (x, y, w, h) = (608, 1488, 252, 135)
+                # Center is (x + w/2, y + h/2)
+                click_coords = (608 + 252 // 2, 1488 + 135 // 2)
+                self.dispatch_action(hwnd, ('click', click_coords))
                 self.last_action_time = current_time
         elif game_state == GameState.PLAYING:
             if current_time - self.last_action_time > self.action_interval:
@@ -129,10 +132,14 @@ class Agent:
                     if self.is_first_move: self.is_first_move = False
 
     def dispatch_action(self, hwnd, action):
-        if hwnd:
-            action_thread = threading.Thread(target=send_key, args=(hwnd, action));
+        if not hwnd: return
+        if isinstance(action, str):
+            action_thread = threading.Thread(target=send_key, args=(hwnd, action))
             action_thread.start()
-
+        elif isinstance(action, tuple) and action[0] == 'click':
+            _, coords = action
+            action_thread = threading.Thread(target=send_click, args=(hwnd, coords[0], coords[1]))
+            action_thread.start()
 
 # --- VISION & CONTROL FUNCTIONS ---
 
@@ -198,11 +205,36 @@ def detect_retry_button(image, template):
 
 def send_key(hwnd, key):
     try:
-        win32gui.SetForegroundWindow(hwnd);
+        win32gui.SetForegroundWindow(hwnd)
         time.sleep(0.1)
-        pydirectinput.press(key);
+        pydirectinput.press(key)
         time.sleep(0.1)
-    except win32ui.error:
+    except (win32ui.error, win32gui.error):
+        print(f"[ERROR] Could not press key on window. Is it closed or minimized?")
+        pass
+
+
+def send_click(hwnd, rel_x, rel_y):
+    try:
+        win32gui.SetForegroundWindow(hwnd)
+        # Get window's client area position on screen
+        left, top, _, _ = win32gui.GetClientRect(hwnd)
+        client_left, client_top = win32gui.ClientToScreen(hwnd, (left, top))
+
+        # The vision thread uses a hardcoded title bar height for screen capture.
+        # We must use it too for coordinate consistency when clicking.
+        TITLE_BAR_HEIGHT = 50
+
+        abs_x = client_left + rel_x
+        abs_y = client_top + TITLE_BAR_HEIGHT + rel_y
+
+        time.sleep(0.1)
+        pydirectinput.moveTo(abs_x, abs_y)
+        time.sleep(0.05)
+        pydirectinput.click()
+        time.sleep(0.1)
+    except (win32ui.error, win32gui.error):
+        print("[ERROR] Could not click on window. Is it closed or minimized?")
         pass
 
 
@@ -233,6 +265,7 @@ class VisionThread(threading.Thread):
         self.latest_score = None
         self.is_dead = False;
         self.in_penalty_zone = False;
+        self.chicken_position = None
         self.running = True
 
     def find_chicken(self, frame):
@@ -284,17 +317,18 @@ class VisionThread(threading.Thread):
                     penalty_detected = False
                     if chicken_pos:
                         cx, cy = chicken_pos
-                        # Adjust cy back to full frame coordinates
-                        cy_full_frame = cy + self.SEARCH_ZONE_Y_INTERCEPT
+                        # The chicken's y-coordinate (cy) is already in the full frame's coordinate system.
+                        # We calculate the penalty line's y-value at the chicken's current x-position.
                         penalty_line_y = int(slope * cx + self.PENALTY_LINE_Y_INTERCEPT)
-                        if cy_full_frame > penalty_line_y:
+                        if cy > penalty_line_y:
                             penalty_detected = True
 
                     with self.lock:
-                        self.latest_frame = game_frame;
+                        self.latest_frame = game_frame
                         self.latest_score = score_val
-                        self.is_dead = death_detected;
+                        self.is_dead = death_detected
                         self.in_penalty_zone = penalty_detected
+                        self.chicken_position = chicken_pos
                 except Exception as e:
                     print(f"Error in Vision Thread: {e}");
                     time.sleep(1)
@@ -322,15 +356,16 @@ def main():
     last_score = 0;
     high_score = 0
     penalty_timer = 0;
-    PENALTY_INTERVAL = 1.0  # seconds
+    PENALTY_INTERVAL = 0.5  # seconds
 
     while True:
         loop_start_time = time.time()
         with vision_thread.lock:
-            frame = vision_thread.latest_frame;
+            frame = vision_thread.latest_frame
             score_str = vision_thread.latest_score
-            is_dead = vision_thread.is_dead;
+            is_dead = vision_thread.is_dead
             in_penalty_zone = vision_thread.in_penalty_zone
+            chicken_pos = vision_thread.chicken_position
 
         if frame is None: print("Waiting for first frame..."); time.sleep(0.5); continue
 
@@ -368,14 +403,31 @@ def main():
             else:
                 penalty_timer = 0  # Reset timer if safe
 
-        display_frame = frame.copy();
+        display_frame = frame.copy()
+
+        # --- Overlays ---
+        frame_h, frame_w, _ = display_frame.shape
+        # Penalty Line
+        angle_rad = math.radians(vision_thread.LINE_ANGLE_DEG)
+        slope = math.tan(angle_rad)
+        penalty_y2 = int(slope * frame_w + vision_thread.PENALTY_LINE_Y_INTERCEPT)
+        cv2.line(display_frame, (0, vision_thread.PENALTY_LINE_Y_INTERCEPT), (frame_w, penalty_y2), (0, 0, 255), 2)
+
+        # Chicken Tracker
+        if chicken_pos:
+            cv2.circle(display_frame, chicken_pos, 15, (0, 255, 255), 3)
+            cv2.putText(display_frame, "CHICKEN", (chicken_pos[0] + 20, chicken_pos[1]), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                        (0, 255, 255), 2)
+
+        # --- Info Text ---
         font = cv2.FONT_HERSHEY_SIMPLEX
         score_text = f"Score: {last_score if game_state == GameState.PLAYING else 'N/A'} | High Score: {high_score}"
-        text_size = cv2.getTextSize(score_text, font, 1, 2)[0];
-        text_x = (frame.shape[1] - text_size[0]) // 2
+        text_size = cv2.getTextSize(score_text, font, 1, 2)[0]
+        text_x = (display_frame.shape[1] - text_size[0]) // 2
         cv2.putText(display_frame, score_text, (text_x, 40), font, 1, (0, 255, 0), 2)
-        state_text = f"State: {game_state.name}";
+        state_text = f"State: {game_state.name}"
         cv2.putText(display_frame, state_text, (10, 40), font, 1, (0, 255, 0), 2)
+
         cv2.imshow('CrossyLearn Vision', display_frame)
         if cv2.waitKey(1) & 0xFF == ord('q'): break
         elapsed_time = time.time() - loop_start_time

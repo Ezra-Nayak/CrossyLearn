@@ -11,11 +11,22 @@ import random
 from enum import Enum
 import torch
 import torch.nn as nn
+import torch.optim as optim
 import torch.nn.functional as F
 import math
-
+from collections import namedtuple, deque
 
 # --- DEEP LEARNING SETUP & MODEL ARCHITECTURE ---
+
+# Hyperparameters
+BATCH_SIZE = 128
+GAMMA = 0.99
+EPS_START = 0.9
+EPS_END = 0.05
+EPS_DECAY = 1000
+TARGET_UPDATE = 10
+REPLAY_MEMORY_SIZE = 10000
+LEARNING_RATE = 1e-4
 
 def setup_device():
     """Checks for DirectML availability and sets the device accordingly."""
@@ -30,6 +41,26 @@ def setup_device():
 
 
 DEVICE = setup_device()
+
+# Define the structure of a single transition (experience)
+Transition = namedtuple('Transition', ('state', 'action', 'next_state', 'reward'))
+
+
+class ReplayMemory(object):
+    """A cyclic buffer of bounded size that holds the transitions observed recently."""
+    def __init__(self, capacity):
+        self.memory = deque([], maxlen=capacity)
+
+    def push(self, *args):
+        """Save a transition"""
+        self.memory.append(Transition(*args))
+
+    def sample(self, batch_size):
+        """Select a random batch of transitions for training"""
+        return random.sample(self.memory, batch_size)
+
+    def __len__(self):
+        return len(self.memory)
 
 
 def preprocess_frame(frame):
@@ -89,17 +120,44 @@ class DuelingDQN(nn.Module):
 class Agent:
     def __init__(self):
         self.actions = ['up', 'left', 'right', 'down']; self.num_actions = len(self.actions)
+        self.action_map = {i: action for i, action in enumerate(self.actions)}
+
         self.policy_net = DuelingDQN(self.num_actions).to(DEVICE)
         self.target_net = DuelingDQN(self.num_actions).to(DEVICE)
         self.target_net.load_state_dict(self.policy_net.state_dict()); self.target_net.eval()
+
+        self.optimizer = optim.Adam(self.policy_net.parameters(), lr=LEARNING_RATE)
+        self.memory = ReplayMemory(REPLAY_MEMORY_SIZE)
+        self.steps_done = 0
+
         self.last_action_time = 0; self.action_interval = 0.5; self.is_first_move = True
+
     def on_new_game(self):
         print("Agent acknowledging new game. Cooldown initiated."); self.is_first_move = True
         self.last_action_time = time.time() + 2.3
-    def choose_action(self, state_tensor, is_first_move):
-        with torch.no_grad(): q_values = self.policy_net(state_tensor)
-        if is_first_move: return random.choice(['up', 'right', 'down'])
-        else: return random.choice(self.actions)
+
+    def choose_action(self, state_tensor):
+        sample = random.random()
+        eps_threshold = EPS_END + (EPS_START - EPS_END) * \
+                        math.exp(-1. * self.steps_done / EPS_DECAY)
+        self.steps_done += 1
+
+        if sample > eps_threshold:
+            with torch.no_grad():
+                # t.max(1) will return largest column value of each row.
+                # second column on max result is index of where max element was
+                # found, so we pick action with the larger expected reward.
+                action_index = self.policy_net(state_tensor).max(1)[1].view(1, 1)
+                return action_index
+        else:
+            # On the first move, avoid 'left' to prevent opening the skin selection menu
+            if self.is_first_move:
+                action_index = torch.tensor([[random.choice([0, 2, 3])]], device=DEVICE, dtype=torch.long) # up, right, down
+            else:
+                action_index = torch.tensor([[random.randrange(self.num_actions)]], device=DEVICE, dtype=torch.long)
+            return action_index
+
+
     def act(self, game_state, hwnd, window_geo, current_frame):
         current_time = time.time()
         if game_state == GameState.MENU:
@@ -112,14 +170,72 @@ class Agent:
                 click_y = client_top + title_bar_height + roi_y + (roi_h // 2)
                 self.dispatch_click(hwnd, (click_x, click_y))
                 self.last_action_time = current_time
+                return None, None # No action taken in the game world
         elif game_state == GameState.PLAYING:
             if current_time - self.last_action_time > self.action_interval:
                 processed_frame = preprocess_frame(current_frame)
                 if processed_frame is not None:
-                    action = self.choose_action(processed_frame, self.is_first_move)
-                    print(f"Agent chose action: {action}"); self.dispatch_action(hwnd, action)
+                    action_index = self.choose_action(processed_frame)
+                    action_name = self.action_map[action_index.item()]
+                    print(f"Agent chose action: {action_name}"); self.dispatch_action(hwnd, action_name)
                     self.last_action_time = current_time
                     if self.is_first_move: self.is_first_move = False
+                    return processed_frame, action_index
+        return None, None
+
+
+    def optimize_model(self):
+        if len(self.memory) < BATCH_SIZE:
+            return
+        transitions = self.memory.sample(BATCH_SIZE)
+        # Transpose the batch (see https://stackoverflow.com/a/19343/3343043 for
+        # detailed explanation). This converts batch-array of Transitions
+        # to Transition of batch-arrays.
+        batch = Transition(*zip(*transitions))
+
+        # Compute a mask of non-final states and concatenate the batch elements
+        non_final_mask = torch.tensor(tuple(map(lambda s: s is not None,
+                                              batch.next_state)), device=DEVICE, dtype=torch.bool)
+        non_final_next_states = torch.cat([s for s in batch.next_state
+                                           if s is not None])
+        state_batch = torch.cat(batch.state)
+        action_batch = torch.cat(batch.action)
+        reward_batch = torch.cat(batch.reward)
+
+        # Compute Q(s_t, a) - the model computes Q(s_t), then we select the
+        # columns of actions taken. These are the actions which would've been taken
+        # for each batch state according to policy_net
+        state_action_values = self.policy_net(state_batch).gather(1, action_batch)
+
+        # Compute V(s_{t+1}) for all next states.
+        # Expected values of actions for non_final_next_states are computed based
+        # on the "older" target_net; selecting their best reward with max(1)[0].
+        # This is merged based on the mask, such that we'll have either the expected
+        # state value or 0 in case the state was final.
+        next_state_values = torch.zeros(BATCH_SIZE, device=DEVICE)
+
+        # Only calculate next_state_values if there are non-final states
+        if torch.any(non_final_mask):
+            next_state_values[non_final_mask] = self.target_net(non_final_next_states).max(1)[0].detach()
+        # Compute the expected Q values
+        expected_state_action_values = (next_state_values * GAMMA) + reward_batch
+
+        # Compute Huber loss
+        criterion = nn.SmoothL1Loss()
+        loss = criterion(state_action_values, expected_state_action_values.unsqueeze(1))
+
+        # Optimize the model
+        self.optimizer.zero_grad()
+        loss.backward()
+        for param in self.policy_net.parameters():
+            param.grad.data.clamp_(-1, 1)
+        self.optimizer.step()
+
+
+    def update_target_net(self):
+        self.target_net.load_state_dict(self.policy_net.state_dict())
+
+
     def dispatch_action(self, hwnd, action):
         if hwnd:
             action_thread = threading.Thread(target=send_key, args=(hwnd, action)); action_thread.start()
@@ -311,14 +427,14 @@ class VisionThread(threading.Thread):
 # --- MAIN APPLICATION LOOP ---
 class GameState(Enum):
     MENU = 1;
-    PLAYING = 2
+    PLAYING = 2;
 
 
 def main():
     WINDOW_TITLE = "Crossy Road";
     TARGET_FPS = 60;
     FRAME_DELAY = 1.0 / TARGET_FPS
-    print("CrossyLearn Agent - Milestone 20: Final Integration")
+    print("CrossyLearn Agent - Milestone 21: Learning Enabled")
     print("--------------------------------------------------")
     vision_thread = VisionThread(WINDOW_TITLE);
     vision_thread.start()
@@ -328,6 +444,9 @@ def main():
     high_score = 0
     penalty_timer = 0;
     PENALTY_INTERVAL = 0.5
+    episode_num = 0
+
+    last_state, last_action = None, None
 
     while True:
         loop_start_time = time.time()
@@ -350,36 +469,71 @@ def main():
             client_left, client_top = win32gui.ClientToScreen(hwnd, (left, top))
             window_geo = (client_left, client_top, 50)
 
-        agent.act(game_state, hwnd, window_geo, frame)
+        # Agent acts and returns the state and action it took
+        current_state, current_action = agent.act(game_state, hwnd, window_geo, frame)
+
+        reward = 0
+        if game_state == GameState.PLAYING:
+            if is_dead:
+                reward = -100
+                print(f"EVENT: Player has died! Score was {last_score}. Punishment: {reward}")
+                game_state = GameState.MENU;
+                print("STATE CHANGE: PLAYING -> MENU")
+                penalty_timer = 0
+                if last_state is not None and last_action is not None:
+                    # 'None' for next_state because the game has ended
+                    reward_tensor = torch.tensor([reward], device=DEVICE)
+                    agent.memory.push(last_state, last_action, None, reward_tensor)
+                last_state, last_action = None, None
+
+            else: # Still playing
+                # Score increase reward
+                if current_score is not None and current_score > last_score:
+                    score_reward = 1
+                    if current_score > high_score:
+                        score_reward += 100
+                        print(f"EVENT: New high score! Jackpot Reward: +100");
+                        high_score = current_score
+                    print(f"EVENT: Score increased to {current_score}! Reward: +{score_reward}")
+                    reward += score_reward
+                    last_score = current_score
+
+                # Penalty zone punishment
+                if in_penalty_zone:
+                    if penalty_timer == 0:
+                        penalty_timer = time.time()
+                    elif time.time() - penalty_timer > PENALTY_INTERVAL:
+                        penalty_punishment = -10
+                        print(f"EVENT: In penalty zone! Punishment: {penalty_punishment}");
+                        reward += penalty_punishment
+                        penalty_timer = time.time()
+                else:
+                    penalty_timer = 0
+
+            # Store the experience in memory
+            if last_state is not None and last_action is not None:
+                reward_tensor = torch.tensor([reward], device=DEVICE)
+                agent.memory.push(last_state, last_action, current_state, reward_tensor)
+
+        # Transition to the next state
+        last_state, last_action = current_state, current_action
+
+        # Perform one step of the optimization (on the policy network)
+        agent.optimize_model()
 
         if game_state == GameState.MENU:
             if current_score is not None and not is_dead:
                 game_state = GameState.PLAYING;
                 last_score = current_score if current_score is not None else 0
-                print("\n--- NEW GAME ---");
+                episode_num += 1
+                print(f"\n--- NEW GAME (Episode {episode_num}) ---");
                 print(f"STATE CHANGE: MENU -> PLAYING (High Score: {high_score})")
                 agent.on_new_game()
-        elif game_state == GameState.PLAYING:
-            if is_dead:
-                print(f"EVENT: Player has died! Score was {last_score}. Punishment: -100")
-                game_state = GameState.MENU;
-                print("STATE CHANGE: PLAYING -> MENU")
-                penalty_timer = 0
-            elif current_score is not None and current_score > last_score:
-                print(f"EVENT: Score increased to {current_score}! Reward: +1")
-                if current_score > high_score:
-                    print(f"EVENT: New high score! Jackpot Reward: +100");
-                    high_score = current_score
-                last_score = current_score
 
-            if in_penalty_zone:
-                if penalty_timer == 0:
-                    penalty_timer = time.time()
-                elif time.time() - penalty_timer > PENALTY_INTERVAL:
-                    print(f"EVENT: In penalty zone! Punishment: -10");
-                    penalty_timer = time.time()
-            else:
-                penalty_timer = 0
+        # Update the target network, copying all weights and biases in the DQN
+        if agent.steps_done % TARGET_UPDATE == 0:
+            agent.update_target_net()
+
 
         display_frame = frame.copy();
         font = cv2.FONT_HERSHEY_SIMPLEX
@@ -387,7 +541,7 @@ def main():
         text_size = cv2.getTextSize(score_text, font, 1, 2)[0];
         text_x = (frame.shape[1] - text_size[0]) // 2
         cv2.putText(display_frame, score_text, (text_x, 40), font, 1, (0, 255, 0), 2)
-        state_text = f"State: {game_state.name}";
+        state_text = f"State: {game_state.name} | Episode: {episode_num}";
         cv2.putText(display_frame, state_text, (10, 40), font, 1, (0, 255, 0), 2)
 
         if penalty_line_pts:

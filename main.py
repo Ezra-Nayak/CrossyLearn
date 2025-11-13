@@ -36,12 +36,13 @@ def main():
                 client_left, client_top = win32gui.ClientToScreen(hwnd, (left, top))
                 client_right, client_bottom = win32gui.ClientToScreen(hwnd, (right, bottom))
 
-                # Define the capture region
+                # Define the capture region, with manual offset for the title bar
+                TITLE_BAR_HEIGHT = 50  # User-measured height of the title bar
                 monitor = {
-                    "top": client_top,
+                    "top": client_top + TITLE_BAR_HEIGHT,
                     "left": client_left,
                     "width": client_right - client_left,
-                    "height": client_bottom - client_top
+                    "height": (client_bottom - client_top) - TITLE_BAR_HEIGHT
                 }
 
                 # Grab the data

@@ -20,13 +20,25 @@ class GameState(Enum):
 
 class Agent:
     def __init__(self):
-        self.actions = ['up', 'left', 'right']
+        self.actions = ['up', 'left', 'right', 'down']
         self.last_action_time = 0
         self.action_interval = 0.5  # seconds between actions
+        self.is_first_move = True
 
-    def choose_action(self):
-        """For now, chooses a random action."""
-        return random.choice(self.actions)
+    def on_new_game(self):
+        """Resets the agent's state for a new game and enforces a cooldown."""
+        print("Agent acknowledging new game. Cooldown initiated.")
+        self.is_first_move = True
+        # Enforce the 2.5-second animation lockout
+        self.last_action_time = time.time() + 2.5
+
+    def choose_action(self, is_first_move):
+        """Chooses a random action, avoiding 'left' on the first move."""
+        if is_first_move:
+            # First move cannot be 'left'
+            return random.choice(['up', 'right', 'down'])
+        else:
+            return random.choice(self.actions)
 
     def act(self, game_state, hwnd):
         """Decides whether to take an action based on game state and timing."""
@@ -34,7 +46,7 @@ class Agent:
 
         if game_state == GameState.MENU:
             # If in menu, wait a bit then press spacebar to start the game.
-            if current_time - self.last_action_time > 2.0:  # 2-second delay before starting
+            if current_time - self.last_action_time > 2.0:
                 print("Agent is starting a new game...")
                 self.dispatch_action(hwnd, 'space')
                 self.last_action_time = current_time
@@ -42,10 +54,13 @@ class Agent:
         elif game_state == GameState.PLAYING:
             # If playing, take an action based on the interval.
             if current_time - self.last_action_time > self.action_interval:
-                action = self.choose_action()
+                action = self.choose_action(self.is_first_move)
                 print(f"Agent chose action: {action}")
                 self.dispatch_action(hwnd, action)
                 self.last_action_time = current_time
+                # After the first action, it's no longer the first move
+                if self.is_first_move:
+                    self.is_first_move = False
 
     def dispatch_action(self, hwnd, action):
         """Sends the keypress in a separate thread to not block the main loop."""
@@ -222,6 +237,8 @@ def main():
                 last_score = current_score if current_score is not None else 0
                 print("\n--- NEW GAME ---")
                 print(f"STATE CHANGE: MENU -> PLAYING (High Score: {high_score})")
+                # Signal the agent that a new game has begun
+                agent.on_new_game()
 
         elif game_state == GameState.PLAYING:
             if is_dead:

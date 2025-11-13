@@ -88,51 +88,44 @@ class DuelingDQN(nn.Module):
 
 class Agent:
     def __init__(self):
-        self.actions = ['up', 'left', 'right', 'down'];
-        self.num_actions = len(self.actions)
+        self.actions = ['up', 'left', 'right', 'down']; self.num_actions = len(self.actions)
         self.policy_net = DuelingDQN(self.num_actions).to(DEVICE)
         self.target_net = DuelingDQN(self.num_actions).to(DEVICE)
-        self.target_net.load_state_dict(self.policy_net.state_dict());
-        self.target_net.eval()
-        self.last_action_time = 0;
-        self.action_interval = 0.5;
-        self.is_first_move = True
-
+        self.target_net.load_state_dict(self.policy_net.state_dict()); self.target_net.eval()
+        self.last_action_time = 0; self.action_interval = 0.5; self.is_first_move = True
     def on_new_game(self):
-        print("Agent acknowledging new game. Cooldown initiated.");
-        self.is_first_move = True
-        self.last_action_time = time.time() + 2.5
-
+        print("Agent acknowledging new game. Cooldown initiated."); self.is_first_move = True
+        self.last_action_time = time.time() + 2.3
     def choose_action(self, state_tensor, is_first_move):
-        with torch.no_grad():
-            q_values = self.policy_net(state_tensor)
-        if is_first_move:
-            return random.choice(['up', 'right', 'down'])
-        else:
-            return random.choice(self.actions)
-
-    def act(self, game_state, hwnd, current_frame):
+        with torch.no_grad(): q_values = self.policy_net(state_tensor)
+        if is_first_move: return random.choice(['up', 'right', 'down'])
+        else: return random.choice(self.actions)
+    def act(self, game_state, hwnd, window_geo, current_frame):
         current_time = time.time()
         if game_state == GameState.MENU:
             if current_time - self.last_action_time > 2.0:
-                print("Agent is starting a new game...");
-                self.dispatch_action(hwnd, 'space')
+                print("Agent is starting a new game via mouse click...")
+                client_left, client_top, title_bar_height = window_geo
+                roi_x, roi_y, roi_w, roi_h = RETRY_BUTTON_ROI
+                # Calculate absolute screen coordinates for the click
+                click_x = client_left + roi_x + (roi_w // 2)
+                click_y = client_top + title_bar_height + roi_y + (roi_h // 2)
+                self.dispatch_click(hwnd, (click_x, click_y))
                 self.last_action_time = current_time
         elif game_state == GameState.PLAYING:
             if current_time - self.last_action_time > self.action_interval:
                 processed_frame = preprocess_frame(current_frame)
                 if processed_frame is not None:
                     action = self.choose_action(processed_frame, self.is_first_move)
-                    print(f"Agent chose action: {action}");
-                    self.dispatch_action(hwnd, action)
+                    print(f"Agent chose action: {action}"); self.dispatch_action(hwnd, action)
                     self.last_action_time = current_time
                     if self.is_first_move: self.is_first_move = False
-
     def dispatch_action(self, hwnd, action):
         if hwnd:
-            action_thread = threading.Thread(target=send_key, args=(hwnd, action));
-            action_thread.start()
-
+            action_thread = threading.Thread(target=send_key, args=(hwnd, action)); action_thread.start()
+    def dispatch_click(self, hwnd, click_pos):
+        if hwnd:
+            click_thread = threading.Thread(target=send_click, args=(hwnd, click_pos)); click_thread.start()
 
 # --- VISION & CONTROL FUNCTIONS ---
 
@@ -184,7 +177,7 @@ def recognize_score(image, templates):
 
 def detect_retry_button(image, template):
     if template is None: return False
-    ROI = (608, 1488, 252, 135);
+    ROI = (649, 1504, 156, 98);
     margin = 10;
     x, y, w, h = ROI
     if y - margin < 0 or y + h + margin > image.shape[0] or x - margin < 0 or x + w + margin > image.shape[
@@ -196,14 +189,22 @@ def detect_retry_button(image, template):
     return max_val > 0.8
 
 
+RETRY_BUTTON_ROI = (649, 1504, 156, 98) # The button's location within the client area
+
 def send_key(hwnd, key):
+    """Sends a keypress to the game window."""
     try:
-        win32gui.SetForegroundWindow(hwnd);
-        time.sleep(0.1)
-        pydirectinput.press(key);
-        time.sleep(0.1)
-    except win32ui.error:
-        pass
+        win32gui.SetForegroundWindow(hwnd); time.sleep(0.05)
+        pydirectinput.press(key); time.sleep(0.05)
+    except win32ui.error: pass
+
+def send_click(hwnd, click_pos):
+    """Moves to and clicks a specific screen coordinate."""
+    try:
+        win32gui.SetForegroundWindow(hwnd); time.sleep(0.05)
+        pydirectinput.moveTo(click_pos[0], click_pos[1])
+        pydirectinput.click(); time.sleep(0.05)
+    except win32ui.error: pass
 
 
 # --- BACKGROUND VISION THREAD (UPGRADED) ---
@@ -213,12 +214,10 @@ class VisionThread(threading.Thread):
         super().__init__();
         self.daemon = True;
         self.window_title = window_title
-        # Load templates
         self.digit_templates = load_digit_templates()
         self.retry_template = cv2.imread('templates/retry_button.png')
         if self.retry_template is None: raise FileNotFoundError("Could not load 'templates/retry_button.png'")
 
-        # --- Final Tuned Parameters ---
         self.LOWER_BOUND = np.array([118, 0, 0])
         self.UPPER_BOUND = np.array([119, 255, 255])
         self.AREA_MIN = 1481
@@ -227,24 +226,25 @@ class VisionThread(threading.Thread):
         self.PENALTY_LINE_Y_INTERCEPT = 1285
         self.LINE_ANGLE_DEG = 15
 
-        # Shared data
         self.lock = threading.Lock()
         self.latest_frame = None;
         self.latest_score = None
         self.is_dead = False;
         self.in_penalty_zone = False;
         self.running = True
+        self.latest_chicken_box = None;
+        self.latest_penalty_line_pts = None
 
     def find_chicken(self, frame):
         hsv_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         mask = cv2.inRange(hsv_frame, self.LOWER_BOUND, self.UPPER_BOUND)
         contours, _ = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-        if not contours: return None
+        if not contours: return None, None
         valid_contours = [c for c in contours if self.AREA_MIN < cv2.contourArea(c) < self.AREA_MAX]
-        if not valid_contours: return None
+        if not valid_contours: return None, None
         chicken_contour = max(valid_contours, key=cv2.contourArea)
         x, y, w, h = cv2.boundingRect(chicken_contour)
-        return (x + w // 2, y + h)
+        return (x + w // 2, y + h), (x, y, w, h)
 
     def run(self):
         with mss.mss() as sct:
@@ -264,11 +264,9 @@ class VisionThread(threading.Thread):
                     game_frame = cv2.cvtColor(np.array(sct.grab(monitor)), cv2.COLOR_BGRA2BGR)
                     frame_h, frame_w, _ = game_frame.shape
 
-                    # --- Full Perception Pipeline ---
                     score_val = recognize_score(game_frame.copy(), self.digit_templates)
                     death_detected = detect_retry_button(game_frame.copy(), self.retry_template)
 
-                    # Angled Search Zone Mask
                     angle_rad = math.radians(self.LINE_ANGLE_DEG);
                     slope = math.tan(angle_rad)
                     search_y1 = self.SEARCH_ZONE_Y_INTERCEPT
@@ -279,22 +277,29 @@ class VisionThread(threading.Thread):
                     cv2.fillPoly(search_mask, [pts], 255)
                     search_area = cv2.bitwise_and(game_frame, game_frame, mask=search_mask)
 
-                    chicken_pos = self.find_chicken(search_area)
+                    chicken_pos, chicken_box = self.find_chicken(search_area)
 
                     penalty_detected = False
                     if chicken_pos:
                         cx, cy = chicken_pos
-                        # Adjust cy back to full frame coordinates
-                        cy_full_frame = cy + self.SEARCH_ZONE_Y_INTERCEPT
-                        penalty_line_y = int(slope * cx + self.PENALTY_LINE_Y_INTERCEPT)
-                        if cy_full_frame > penalty_line_y:
+                        # The cy coordinate from find_chicken is already in the full frame's coordinate system.
+                        # No adjustment is needed.
+                        penalty_line_y_at_chicken = int(slope * cx + self.PENALTY_LINE_Y_INTERCEPT)
+                        if cy > penalty_line_y_at_chicken:
                             penalty_detected = True
+
+                    # Calculate penalty line endpoints for visualization
+                    p_x1, p_y1 = 0, self.PENALTY_LINE_Y_INTERCEPT
+                    p_x2, p_y2 = frame_w, int(slope * frame_w + self.PENALTY_LINE_Y_INTERCEPT)
+                    penalty_line_pts = ((p_x1, p_y1), (p_x2, p_y2))
 
                     with self.lock:
                         self.latest_frame = game_frame;
                         self.latest_score = score_val
                         self.is_dead = death_detected;
                         self.in_penalty_zone = penalty_detected
+                        self.latest_chicken_box = chicken_box
+                        self.latest_penalty_line_pts = penalty_line_pts
                 except Exception as e:
                     print(f"Error in Vision Thread: {e}");
                     time.sleep(1)
@@ -313,8 +318,8 @@ def main():
     WINDOW_TITLE = "Crossy Road";
     TARGET_FPS = 60;
     FRAME_DELAY = 1.0 / TARGET_FPS
-    print("CrossyLearn Agent - Milestone 19: Final Perception System")
-    print("---------------------------------------------------------")
+    print("CrossyLearn Agent - Milestone 20: Final Integration")
+    print("--------------------------------------------------")
     vision_thread = VisionThread(WINDOW_TITLE);
     vision_thread.start()
     agent = Agent();
@@ -322,7 +327,7 @@ def main():
     last_score = 0;
     high_score = 0
     penalty_timer = 0;
-    PENALTY_INTERVAL = 1.0  # seconds
+    PENALTY_INTERVAL = 0.5
 
     while True:
         loop_start_time = time.time()
@@ -331,12 +336,21 @@ def main():
             score_str = vision_thread.latest_score
             is_dead = vision_thread.is_dead;
             in_penalty_zone = vision_thread.in_penalty_zone
+            chicken_box = vision_thread.latest_chicken_box
+            penalty_line_pts = vision_thread.latest_penalty_line_pts
 
         if frame is None: print("Waiting for first frame..."); time.sleep(0.5); continue
 
         current_score = int(score_str) if score_str is not None and score_str.isdigit() else None
+
         hwnd = win32gui.FindWindow(None, WINDOW_TITLE)
-        agent.act(game_state, hwnd, frame)
+        window_geo = None
+        if hwnd:
+            left, top, right, bottom = win32gui.GetClientRect(hwnd)
+            client_left, client_top = win32gui.ClientToScreen(hwnd, (left, top))
+            window_geo = (client_left, client_top, 50)
+
+        agent.act(game_state, hwnd, window_geo, frame)
 
         if game_state == GameState.MENU:
             if current_score is not None and not is_dead:
@@ -350,7 +364,7 @@ def main():
                 print(f"EVENT: Player has died! Score was {last_score}. Punishment: -100")
                 game_state = GameState.MENU;
                 print("STATE CHANGE: PLAYING -> MENU")
-                penalty_timer = 0  # Reset timer on death
+                penalty_timer = 0
             elif current_score is not None and current_score > last_score:
                 print(f"EVENT: Score increased to {current_score}! Reward: +1")
                 if current_score > high_score:
@@ -358,7 +372,6 @@ def main():
                     high_score = current_score
                 last_score = current_score
 
-            # Penalty Zone Logic
             if in_penalty_zone:
                 if penalty_timer == 0:
                     penalty_timer = time.time()
@@ -366,7 +379,7 @@ def main():
                     print(f"EVENT: In penalty zone! Punishment: -10");
                     penalty_timer = time.time()
             else:
-                penalty_timer = 0  # Reset timer if safe
+                penalty_timer = 0
 
         display_frame = frame.copy();
         font = cv2.FONT_HERSHEY_SIMPLEX
@@ -376,6 +389,13 @@ def main():
         cv2.putText(display_frame, score_text, (text_x, 40), font, 1, (0, 255, 0), 2)
         state_text = f"State: {game_state.name}";
         cv2.putText(display_frame, state_text, (10, 40), font, 1, (0, 255, 0), 2)
+
+        if penalty_line_pts:
+            cv2.line(display_frame, penalty_line_pts[0], penalty_line_pts[1], (0, 0, 255), 2)
+        if chicken_box and game_state == GameState.PLAYING:
+            x, y, w, h = chicken_box
+            cv2.rectangle(display_frame, (x, y), (x + w, y + h), (255, 0, 0), 2)
+
         cv2.imshow('CrossyLearn Vision', display_frame)
         if cv2.waitKey(1) & 0xFF == ord('q'): break
         elapsed_time = time.time() - loop_start_time

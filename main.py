@@ -7,6 +7,11 @@ import win32ui
 import os
 import pydirectinput
 import threading
+from enum import Enum
+
+class GameState(Enum):
+    MENU = 1
+    PLAYING = 2
 
 
 # --- All functions from before remain the same ---
@@ -63,6 +68,22 @@ def recognize_score(image, templates):
     return score_str if score_str else None
 
 
+def detect_retry_button(image, template):
+    """Detects the retry button on the screen to confirm player death."""
+    if template is None:
+        return False
+
+    # Define an ROI for the bottom half of the screen where the button appears
+    h, w, _ = image.shape
+    RETRY_ROI = image[h // 2:, :]  # Search the bottom half
+
+    res = cv2.matchTemplate(RETRY_ROI, template, cv2.TM_CCOEFF_NORMED)
+    _, max_val, _, _ = cv2.minMaxLoc(res)
+
+    # If the best match is very high, we've found the button
+    return max_val > 0.9
+
+
 def send_key(hwnd, key):
     """Brings the specified window to the foreground and presses a key."""
     try:
@@ -80,14 +101,18 @@ def send_key(hwnd, key):
 class VisionThread(threading.Thread):
     def __init__(self, window_title):
         super().__init__()
-        self.daemon = True  # Allows main thread to exit even if this thread is running
+        self.daemon = True
         self.window_title = window_title
-        self.templates = load_digit_templates()
+        self.digit_templates = load_digit_templates()
+        self.retry_template = cv2.imread('templates/retry_button.png')
+        if self.retry_template is None:
+            raise FileNotFoundError("Could not load 'templates/retry_button.png'")
 
-        # Shared data between threads
+        # Shared data
         self.lock = threading.Lock()
         self.latest_frame = None
         self.latest_score = None
+        self.is_dead = False
         self.running = True
 
     def run(self):
@@ -114,12 +139,15 @@ class VisionThread(threading.Thread):
                     img_bgra = sct.grab(monitor)
                     game_frame = cv2.cvtColor(np.array(img_bgra), cv2.COLOR_BGRA2BGR)
 
-                    score_val = recognize_score(game_frame.copy(), self.templates)
+                    # --- Perform all vision analysis ---
+                    score_val = recognize_score(game_frame.copy(), self.digit_templates)
+                    death_detected = detect_retry_button(game_frame.copy(), self.retry_template)
 
-                    # Use lock to update shared data safely
+                    # --- Safely update shared data ---
                     with self.lock:
                         self.latest_frame = game_frame
                         self.latest_score = score_val
+                        self.is_dead = death_detected
 
                 except Exception as e:
                     print(f"Error in Vision Thread: {e}")
@@ -134,57 +162,65 @@ def main():
     TARGET_FPS = 60
     FRAME_DELAY = 1.0 / TARGET_FPS
 
-    print("CrossyLearn Agent - Milestone 8: Multithreaded Architecture")
-    print("----------------------------------------------------------")
+    print("CrossyLearn Agent - Milestone 11: Vision-Based Death Detection")
+    print("-------------------------------------------------------------")
 
-    # Start the vision processing in a background thread
     vision_thread = VisionThread(WINDOW_TITLE)
     vision_thread.start()
 
-    last_action_time = time.time()
-    action_interval = 3.0
+    game_state = GameState.MENU
+    last_score = 0
 
     while True:
         loop_start_time = time.time()
 
-        # Get the latest data from the vision thread
         with vision_thread.lock:
             frame = vision_thread.latest_frame
-            score = vision_thread.latest_score
+            score_str = vision_thread.latest_score
+            is_dead = vision_thread.is_dead
 
         if frame is None:
             print("Waiting for first frame from vision thread...")
             time.sleep(0.5)
             continue
 
-        display_score = score if score is not None else "N/A"
+        current_score = int(score_str) if score_str is not None and score_str.isdigit() else None
+
+        # --- Rewritten Game State Machine ---
+        if game_state == GameState.MENU:
+            # Transition to PLAYING when score appears AND we are not on a death screen
+            if current_score is not None and not is_dead:
+                game_state = GameState.PLAYING
+                last_score = current_score
+                print("STATE CHANGE: MENU -> PLAYING")
+
+        elif game_state == GameState.PLAYING:
+            # INSTANT death detection via retry button
+            if is_dead:
+                print(f"EVENT: Player has died! Score was {last_score}. Reward: -100")
+                game_state = GameState.MENU
+                print("STATE CHANGE: PLAYING -> MENU")
+            # Detect score increase
+            elif current_score is not None and current_score > last_score:
+                reward = (current_score - last_score) * 10
+                print(f"EVENT: Score increased to {current_score}! Reward: +{reward}")
+                last_score = current_score
+
+        # --- Display ---
         display_frame = frame.copy()
-
-        # --- Agent Action (Asynchronous) ---
-        current_time = time.time()
-        if current_time - last_action_time > action_interval:
-            print(f"Dispatching 'up' command to game at {current_time:.2f}")
-            hwnd = win32gui.FindWindow(None, WINDOW_TITLE)
-            if hwnd:
-                # Run the blocking send_key function in a separate thread
-                # to avoid blocking the main render loop.
-                action_thread = threading.Thread(target=send_key, args=(hwnd, 'up'))
-                action_thread.start()
-
-            last_action_time = current_time
-
-        # --- Display (Lightweight) ---
         font = cv2.FONT_HERSHEY_SIMPLEX
-        text = f"Score: {display_score}"
+        display_score_text = str(last_score) if game_state == GameState.PLAYING and current_score is not None else "N/A"
+        text = f"Score: {display_score_text}"
         text_size = cv2.getTextSize(text, font, 1, 2)[0]
         text_x = (frame.shape[1] - text_size[0]) // 2
         cv2.putText(display_frame, text, (text_x, 40), font, 1, (0, 0, 255), 2)
+        state_text = f"State: {game_state.name}"
+        cv2.putText(display_frame, state_text, (10, 40), font, 1, (0, 0, 255), 2)
         cv2.imshow('CrossyLearn Vision', display_frame)
 
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
-        # --- Precise Frame Rate Limiting ---
         elapsed_time = time.time() - loop_start_time
         sleep_duration = FRAME_DELAY - elapsed_time
         if sleep_duration > 0:
@@ -192,7 +228,7 @@ def main():
 
     print("Shutting down...")
     vision_thread.stop()
-    vision_thread.join()  # Wait for the thread to finish cleanly
+    vision_thread.join()
     cv2.destroyAllWindows()
 
 

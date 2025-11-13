@@ -7,6 +7,7 @@ import win32ui
 import os
 import pydirectinput
 import threading
+import random
 from enum import Enum
 
 
@@ -15,10 +16,48 @@ class GameState(Enum):
     PLAYING = 2
 
 
+# --- AGENT CLASS ---
+
+class Agent:
+    def __init__(self):
+        self.actions = ['up', 'left', 'right']
+        self.last_action_time = 0
+        self.action_interval = 0.5  # seconds between actions
+
+    def choose_action(self):
+        """For now, chooses a random action."""
+        return random.choice(self.actions)
+
+    def act(self, game_state, hwnd):
+        """Decides whether to take an action based on game state and timing."""
+        current_time = time.time()
+
+        if game_state == GameState.MENU:
+            # If in menu, wait a bit then press spacebar to start the game.
+            if current_time - self.last_action_time > 2.0:  # 2-second delay before starting
+                print("Agent is starting a new game...")
+                self.dispatch_action(hwnd, 'space')
+                self.last_action_time = current_time
+
+        elif game_state == GameState.PLAYING:
+            # If playing, take an action based on the interval.
+            if current_time - self.last_action_time > self.action_interval:
+                action = self.choose_action()
+                print(f"Agent chose action: {action}")
+                self.dispatch_action(hwnd, action)
+                self.last_action_time = current_time
+
+    def dispatch_action(self, hwnd, action):
+        """Sends the keypress in a separate thread to not block the main loop."""
+        if hwnd:
+            action_thread = threading.Thread(target=send_key, args=(hwnd, action))
+            action_thread.start()
+
+
 # --- VISION & CONTROL FUNCTIONS ---
 
 def load_digit_templates():
-    """Loads digit templates from the /templates directory."""
+    # ... (rest of the functions are unchanged)
     templates = {}
     template_dir = 'templates'
     if not os.path.exists(template_dir):
@@ -32,7 +71,6 @@ def load_digit_templates():
 
 
 def recognize_score(image, templates):
-    """Recognizes the score using a dynamic, contour-based approach."""
     SCORE_ROI = (10, 150, 10, 250)
     TEMPLATE_HEIGHT = 40
     roi = image[SCORE_ROI[0]:SCORE_ROI[1], SCORE_ROI[2]:SCORE_ROI[3]]
@@ -70,32 +108,22 @@ def recognize_score(image, templates):
 
 
 def detect_retry_button(image, template):
-    """
-    Detects the retry button within a precise, hard-coded ROI for maximum performance.
-    """
     if template is None: return False
-
-    # The precise ROI you found with find_roi.py
-    # Format: (x, y, w, h)
     ROI = (608, 1488, 252, 135)
-
-    # Add a small margin for safety in case of minor pixel shifts
     margin = 10
     x, y, w, h = ROI
+    # Check if ROI is within image bounds
+    if y - margin < 0 or y + h + margin > image.shape[0] or x - margin < 0 or x + w + margin > image.shape[1]:
+        return False
     search_area = image[y - margin: y + h + margin, x - margin: x + w + margin]
-
-    # Ensure the search area is valid
     if search_area.shape[0] < template.shape[0] or search_area.shape[1] < template.shape[1]:
         return False
-
     res = cv2.matchTemplate(search_area, template, cv2.TM_CCOEFF_NORMED)
     _, max_val, _, _ = cv2.minMaxLoc(res)
-
-    return max_val > 0.8  # Use a slightly more lenient threshold in a tight ROI
+    return max_val > 0.8
 
 
 def send_key(hwnd, key):
-    """Brings the specified window to the foreground and presses a key."""
     try:
         win32gui.SetForegroundWindow(hwnd)
         time.sleep(0.1)
@@ -106,8 +134,6 @@ def send_key(hwnd, key):
         pass
 
 
-# --- BACKGROUND VISION THREAD ---
-
 class VisionThread(threading.Thread):
     def __init__(self, window_title):
         super().__init__()
@@ -117,7 +143,6 @@ class VisionThread(threading.Thread):
         self.retry_template = cv2.imread('templates/retry_button.png')
         if self.retry_template is None:
             raise FileNotFoundError("Could not load 'templates/retry_button.png'")
-
         self.lock = threading.Lock()
         self.latest_frame = None
         self.latest_score = None
@@ -139,11 +164,9 @@ class VisionThread(threading.Thread):
                         "width": client_right - client_left, "height": (client_bottom - client_top) - TITLE_BAR_HEIGHT
                     }
                     if monitor['width'] <= 0 or monitor['height'] <= 0: time.sleep(0.1); continue
-
                     game_frame = cv2.cvtColor(np.array(sct.grab(monitor)), cv2.COLOR_BGRA2BGR)
                     score_val = recognize_score(game_frame.copy(), self.digit_templates)
                     death_detected = detect_retry_button(game_frame.copy(), self.retry_template)
-
                     with self.lock:
                         self.latest_frame = game_frame
                         self.latest_score = score_val
@@ -163,12 +186,13 @@ def main():
     TARGET_FPS = 60
     FRAME_DELAY = 1.0 / TARGET_FPS
 
-    print("CrossyLearn Agent - Milestone 12: Optimized Detection & Hybrid Rewards")
-    print("---------------------------------------------------------------------")
+    print("CrossyLearn Agent - Milestone 13: Baseline Autonomous Agent")
+    print("-----------------------------------------------------------")
 
     vision_thread = VisionThread(WINDOW_TITLE)
     vision_thread.start()
 
+    agent = Agent()
     game_state = GameState.MENU
     last_score = 0
     high_score = 0
@@ -187,11 +211,15 @@ def main():
 
         current_score = int(score_str) if score_str is not None and score_str.isdigit() else None
 
-        # --- Hybrid Reward Game State Machine ---
+        # --- Agent takes an action ---
+        hwnd = win32gui.FindWindow(None, WINDOW_TITLE)
+        agent.act(game_state, hwnd)
+
+        # --- Game State Machine ---
         if game_state == GameState.MENU:
             if current_score is not None and not is_dead:
                 game_state = GameState.PLAYING
-                last_score = current_score
+                last_score = current_score if current_score is not None else 0
                 print("\n--- NEW GAME ---")
                 print(f"STATE CHANGE: MENU -> PLAYING (High Score: {high_score})")
 

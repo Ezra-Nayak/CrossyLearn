@@ -1,8 +1,10 @@
 import cv2
 import numpy as np
 import mss
-import pygetwindow as gw
 import time
+import win32gui
+import win32ui
+import win32con
 
 def main():
     """
@@ -12,26 +14,34 @@ def main():
     TARGET_FPS = 60
     FRAME_DELAY = 1.0 / TARGET_FPS
 
-    print("CrossyLearn Agent - Milestone 1: Vision System")
-    print("---------------------------------------------")
+    print("CrossyLearn Agent - Milestone 2: Refined Vision System")
+    print("------------------------------------------------------")
     print(f"Attempting to find window: '{WINDOW_TITLE}'")
 
     with mss.mss() as sct:
         while True:
-            try:
-                # Find the game window
-                game_window = gw.getWindowsWithTitle(WINDOW_TITLE)[0]
-                if not game_window:
-                    print(f"'{WINDOW_TITLE}' window not found. Please ensure the game is running. Retrying...")
-                    time.sleep(2)
-                    continue
+            loop_start_time = time.time()
 
-                # Define the capture region based on the window's geometry
+            # Find the game window handle (hwnd)
+            hwnd = win32gui.FindWindow(None, WINDOW_TITLE)
+            if not hwnd:
+                print(f"'{WINDOW_TITLE}' window not found. Please ensure the game is running. Retrying...")
+                time.sleep(2)
+                continue
+
+            try:
+                # Get the client area rectangle
+                left, top, right, bottom = win32gui.GetClientRect(hwnd)
+                # Convert client area coords to screen coords
+                client_left, client_top = win32gui.ClientToScreen(hwnd, (left, top))
+                client_right, client_bottom = win32gui.ClientToScreen(hwnd, (right, bottom))
+
+                # Define the capture region
                 monitor = {
-                    "top": game_window.top,
-                    "left": game_window.left,
-                    "width": game_window.width,
-                    "height": game_window.height
+                    "top": client_top,
+                    "left": client_left,
+                    "width": client_right - client_left,
+                    "height": client_bottom - client_top
                 }
 
                 # Grab the data
@@ -44,15 +54,19 @@ def main():
                 # Display the resulting frame
                 cv2.imshow('CrossyLearn Vision', img_rgb)
 
-                # Frame rate limiting
-                time.sleep(FRAME_DELAY)
-
                 # Exit condition
                 if cv2.waitKey(1) & 0xFF == ord('q'):
                     break
 
-            except IndexError:
-                print(f"'{WINDOW_TITLE}' window not found. Please ensure the game is running. Retrying...")
+                # Precise frame rate limiting
+                elapsed_time = time.time() - loop_start_time
+                sleep_duration = FRAME_DELAY - elapsed_time
+                if sleep_duration > 0:
+                    time.sleep(sleep_duration)
+
+            except win32ui.error as e:
+                # This can happen if the window is closed between FindWindow and GetClientRect
+                print(f"Window handle error: {e}. Retrying...")
                 time.sleep(2)
             except Exception as e:
                 print(f"An unexpected error occurred: {e}")

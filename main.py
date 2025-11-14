@@ -1,3 +1,5 @@
+# --- CrossyLearn: Modern Architecture with Baseline Agent (Corrected) ---
+
 import cv2
 import numpy as np
 import mss
@@ -9,277 +11,121 @@ import pydirectinput
 import threading
 import random
 from enum import Enum
-import torch
-import torch.nn as nn
-import torch.optim as optim
-import torch.nn.functional as F
+import queue
 import math
-from collections import namedtuple, deque
-
-# --- DEEP LEARNING SETUP & MODEL ARCHITECTURE ---
-
-# Hyperparameters
-BATCH_SIZE = 32
-GAMMA = 0.99
-EPS_START = 0.9
-EPS_END = 0.05
-EPS_DECAY = 1000
-TARGET_UPDATE = 10
-REPLAY_MEMORY_SIZE = 10000
-LEARNING_RATE = 1e-4
-
-def setup_device():
-    """Checks for DirectML availability and sets the device accordingly."""
-    try:
-        import torch_directml
-        dml_device = torch_directml.device(torch_directml.default_device())
-        print(f"[INFO] PyTorch is using DirectML device: {dml_device}")
-        return dml_device
-    except (ImportError, Exception):
-        print("[INFO] DirectML not found or failed. Falling back to CPU.")
-        return torch.device("cpu")
 
 
-DEVICE = setup_device()
-
-# Define the structure of a single transition (experience)
-Transition = namedtuple('Transition', ('state', 'action', 'next_state', 'reward'))
-
-
-class ReplayMemory(object):
-    """A cyclic buffer of bounded size that holds the transitions observed recently."""
-    def __init__(self, capacity):
-        self.memory = deque([], maxlen=capacity)
-
-    def push(self, *args):
-        """Save a transition"""
-        self.memory.append(Transition(*args))
-
-    def sample(self, batch_size):
-        """Select a random batch of transitions for training"""
-        return random.sample(self.memory, batch_size)
-
-    def __len__(self):
-        return len(self.memory)
+class GameState(Enum):
+    MENU = 1
+    PLAYING = 2
 
 
-def preprocess_frame(frame):
-    """Preprocesses a game frame for the DQN."""
-    if frame is None: return None
-    gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    resized_frame = cv2.resize(gray_frame, (84, 84), interpolation=cv2.INTER_AREA)
-    tensor_frame = torch.from_numpy(resized_frame).unsqueeze(0).unsqueeze(0).float().to(DEVICE) / 255.0
-    return tensor_frame
-
-
-class ResidualBlock(nn.Module):
-    def __init__(self, in_channels):
-        super(ResidualBlock, self).__init__()
-        self.conv1 = nn.Conv2d(in_channels, in_channels, kernel_size=3, stride=1, padding=1)
-        self.relu = nn.ReLU()
-
-    def forward(self, x):
-        identity = x;
-        out = self.relu(self.conv1(x));
-        out = self.conv1(out)
-        out += identity;
-        return self.relu(out)
-
-
-class DuelingDQN(nn.Module):
-    def __init__(self, num_actions):
-        super(DuelingDQN, self).__init__()
-        self.conv1 = nn.Conv2d(1, 32, kernel_size=8, stride=4)
-        self.conv2 = nn.Conv2d(32, 64, kernel_size=4, stride=2)
-        self.conv3 = nn.Conv2d(64, 64, kernel_size=3, stride=1)
-        self.res1 = ResidualBlock(64);
-        self.res2 = ResidualBlock(64)
-        self.value_fc = nn.Linear(7 * 7 * 64, 512);
-        self.value_output = nn.Linear(512, 1)
-        self.advantage_fc = nn.Linear(7 * 7 * 64, 512);
-        self.advantage_output = nn.Linear(512, num_actions)
-        self.relu = nn.ReLU()
-
-    def forward(self, x):
-        x = self.relu(self.conv1(x));
-        x = self.relu(self.conv2(x));
-        x = self.relu(self.conv3(x))
-        x = self.res1(x);
-        x = self.res2(x);
-        x = x.view(x.size(0), -1)
-        value = self.relu(self.value_fc(x));
-        value = self.value_output(value)
-        advantage = self.relu(self.advantage_fc(x));
-        advantage = self.advantage_output(advantage)
-        q_values = value + (advantage - advantage.mean(dim=1, keepdim=True));
-        return q_values
-
-
-# --- AGENT CLASS ---
+# --- AGENT CLASS (Corrected logic from before) ---
 
 class Agent:
     def __init__(self):
-        self.actions = ['up', 'left', 'right', 'down']; self.num_actions = len(self.actions)
-        self.action_map = {i: action for i, action in enumerate(self.actions)}
-
-        self.policy_net = DuelingDQN(self.num_actions).to(DEVICE)
-        self.target_net = DuelingDQN(self.num_actions).to(DEVICE)
-        self.target_net.load_state_dict(self.policy_net.state_dict()); self.target_net.eval()
-
-        self.optimizer = optim.Adam(self.policy_net.parameters(), lr=LEARNING_RATE)
-        self.memory = ReplayMemory(REPLAY_MEMORY_SIZE)
-        self.steps_done = 0
-
-        self.last_action_time = 0; self.action_interval = 0.5; self.is_first_move = True
+        self.actions = ['up', 'left', 'right', 'down']
+        self.last_action_time = 0
+        self.action_interval = 0.25  # Normal seconds between actions
+        self.new_game_cooldown = 2.5  # Special delay for the first action
+        self.is_first_move = True
 
     def on_new_game(self):
-        print("Agent acknowledging new game. Cooldown initiated."); self.is_first_move = True
-        self.last_action_time = time.time() + 2.3
+        """Resets the agent's state for a new game."""
+        print("Agent acknowledging new game. Cooldown will be applied on first move.")
+        self.is_first_move = True
+        # We set last_action_time to the current time.
+        # The cooldown logic is now handled entirely within the act() method.
+        self.last_action_time = time.time()
 
-    def choose_action(self, state_tensor):
-        sample = random.random()
-        eps_threshold = EPS_END + (EPS_START - EPS_END) * \
-                        math.exp(-1. * self.steps_done / EPS_DECAY)
-        self.steps_done += 1
-
-        if sample > eps_threshold:
-            with torch.no_grad():
-                # t.max(1) will return largest column value of each row.
-                # second column on max result is index of where max element was
-                # found, so we pick action with the larger expected reward.
-                action_index = self.policy_net(state_tensor).max(1)[1].view(1, 1)
-                return action_index
+    def choose_action(self):
+        """Chooses a random action, avoiding 'left' on the first move."""
+        if self.is_first_move:
+            return random.choice(['up', 'right', 'down'])
         else:
-            # On the first move, avoid 'left' to prevent opening the skin selection menu
-            if self.is_first_move:
-                action_index = torch.tensor([[random.choice([0, 2, 3])]], device=DEVICE, dtype=torch.long) # up, right, down
-            else:
-                action_index = torch.tensor([[random.randrange(self.num_actions)]], device=DEVICE, dtype=torch.long)
-            return action_index
+            return random.choice(self.actions)
 
-
-    def act(self, game_state, hwnd, window_geo, current_frame):
+    def act(self, game_state, hwnd, window_geo):
+        """Decides whether to take an action based on game state and timing."""
         current_time = time.time()
+
         if game_state == GameState.MENU:
+            # If in menu, wait a bit then click the retry button to start.
             if current_time - self.last_action_time > 2.0:
                 print("Agent is starting a new game via mouse click...")
-                client_left, client_top, title_bar_height = window_geo
-                roi_x, roi_y, roi_w, roi_h = RETRY_BUTTON_ROI
-                # Calculate absolute screen coordinates for the click
-                click_x = client_left + roi_x + (roi_w // 2)
-                click_y = client_top + title_bar_height + roi_y + (roi_h // 2)
-                self.dispatch_click(hwnd, (click_x, click_y))
-                self.last_action_time = current_time
-                return None, None # No action taken in the game world
-        elif game_state == GameState.PLAYING:
-            if current_time - self.last_action_time > self.action_interval:
-                processed_frame = preprocess_frame(current_frame)
-                if processed_frame is not None:
-                    action_index = self.choose_action(processed_frame)
-                    action_name = self.action_map[action_index.item()]
-                    print(f"Agent chose action: {action_name}"); self.dispatch_action(hwnd, action_name)
+                if window_geo:
+                    client_left, client_top, title_bar_height = window_geo
+                    roi_x, roi_y, roi_w, roi_h = RETRY_BUTTON_ROI
+                    click_x = client_left + roi_x + (roi_w // 2)
+                    click_y = client_top + title_bar_height + roi_y + (roi_h // 2)
+                    self.dispatch_click(hwnd, (click_x, click_y))
                     self.last_action_time = current_time
-                    if self.is_first_move: self.is_first_move = False
-                    return processed_frame, action_index
-        return None, None
 
+        elif game_state == GameState.PLAYING:
+            # Determine the correct interval: a long one for the first move, a short one for all others.
+            interval = self.new_game_cooldown if self.is_first_move else self.action_interval
 
-    def optimize_model(self):
-        if len(self.memory) < BATCH_SIZE:
-            return
-        transitions = self.memory.sample(BATCH_SIZE)
-        # Transpose the batch (see https://stackoverflow.com/a/19343/3343043 for
-        # detailed explanation). This converts batch-array of Transitions
-        # to Transition of batch-arrays.
-        batch = Transition(*zip(*transitions))
-
-        # Compute a mask of non-final states and concatenate the batch elements
-        non_final_mask = torch.tensor(tuple(map(lambda s: s is not None,
-                                              batch.next_state)), device=DEVICE, dtype=torch.bool)
-        non_final_next_states = torch.cat([s for s in batch.next_state
-                                           if s is not None])
-        state_batch = torch.cat(batch.state)
-        action_batch = torch.cat(batch.action)
-        reward_batch = torch.cat(batch.reward)
-
-        # Compute Q(s_t, a) - the model computes Q(s_t), then we select the
-        # columns of actions taken. These are the actions which would've been taken
-        # for each batch state according to policy_net
-        state_action_values = self.policy_net(state_batch).gather(1, action_batch)
-
-        # Compute V(s_{t+1}) for all next states.
-        # Expected values of actions for non_final_next_states are computed based
-        # on the "older" target_net; selecting their best reward with max(1)[0].
-        # This is merged based on the mask, such that we'll have either the expected
-        # state value or 0 in case the state was final.
-        next_state_values = torch.zeros(BATCH_SIZE, device=DEVICE)
-
-        # Only calculate next_state_values if there are non-final states
-        if torch.any(non_final_mask):
-            next_state_values[non_final_mask] = self.target_net(non_final_next_states).max(1)[0].detach()
-        # Compute the expected Q values
-        expected_state_action_values = (next_state_values * GAMMA) + reward_batch
-
-        # Compute Huber loss
-        criterion = nn.SmoothL1Loss()
-        loss = criterion(state_action_values, expected_state_action_values.unsqueeze(1))
-
-        # Optimize the model
-        self.optimizer.zero_grad()
-        loss.backward()
-        for param in self.policy_net.parameters():
-            param.grad.data.clamp_(-1, 1)
-        self.optimizer.step()
-
-
-    def update_target_net(self):
-        self.target_net.load_state_dict(self.policy_net.state_dict())
-
+            if current_time - self.last_action_time > interval:
+                action = self.choose_action()
+                print(f"Agent chose action: {action}")
+                self.dispatch_action(hwnd, action)
+                self.last_action_time = current_time
+                if self.is_first_move:
+                    self.is_first_move = False
 
     def dispatch_action(self, hwnd, action):
         if hwnd:
-            action_thread = threading.Thread(target=send_key, args=(hwnd, action)); action_thread.start()
+            action_thread = threading.Thread(target=send_key, args=(hwnd, action))
+            action_thread.start()
+
     def dispatch_click(self, hwnd, click_pos):
         if hwnd:
-            click_thread = threading.Thread(target=send_click, args=(hwnd, click_pos)); click_thread.start()
+            click_thread = threading.Thread(target=send_click, args=(hwnd, click_pos))
+            click_thread.start()
 
-# --- VISION & CONTROL FUNCTIONS ---
+
+# --- VISION & CONTROL FUNCTIONS (Unchanged) ---
 
 def load_digit_templates():
-    templates = {};
+    templates = {}
     template_dir = 'templates'
-    if not os.path.exists(template_dir): raise FileNotFoundError(f"Template directory '{template_dir}' not found.")
+    if not os.path.exists(template_dir):
+        raise FileNotFoundError(f"Template directory '{template_dir}' not found.")
     for i in range(10):
         filepath = os.path.join(template_dir, f"{i}.png")
-        if os.path.exists(filepath): templates[i] = cv2.imread(filepath, 0)
-    print(f"Loaded {len(templates)} digit templates.");
+        if os.path.exists(filepath):
+            templates[i] = cv2.imread(filepath, 0)
+    print(f"Loaded {len(templates)} digit templates.")
     return templates
 
 
 def recognize_score(image, templates):
     SCORE_ROI = (10, 121, 10, 233)
     TEMPLATE_HEIGHT = 40
-    roi = image[SCORE_ROI[0]:SCORE_ROI[1], SCORE_ROI[2]:SCORE_ROI[3]]
-    gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-    _, thresh_roi = cv2.threshold(gray_roi, 180, 255, cv2.THRESH_BINARY)
+    try:
+        roi = image[SCORE_ROI[0]:SCORE_ROI[1], SCORE_ROI[2]:SCORE_ROI[3]]
+        gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        _, thresh_roi = cv2.threshold(gray_roi, 180, 255, cv2.THRESH_BINARY)
+    except Exception:
+        return None
     contours, _ = cv2.findContours(thresh_roi, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     detected_digits = []
     for contour in contours:
         if cv2.contourArea(contour) < 50: continue
-        x, y, w, h = cv2.boundingRect(contour);
+        x, y, w, h = cv2.boundingRect(contour)
         digit_crop = thresh_roi[y:y + h, x:x + w]
-        aspect_ratio = w / h;
+        aspect_ratio = w / h
         new_width = int(TEMPLATE_HEIGHT * aspect_ratio)
         if new_width <= 0: continue
         standardized_digit = cv2.resize(digit_crop, (new_width, TEMPLATE_HEIGHT), interpolation=cv2.INTER_AREA)
         best_match_score, best_match_digit = -1, -1
         for digit_val, template in templates.items():
             h_t, w_t = template.shape;
-            h_s, w_s = standardized_digit.shape;
+            h_s, w_s = standardized_digit.shape
             max_w = max(w_t, w_s)
             padded_template = np.zeros((TEMPLATE_HEIGHT, max_w), dtype=np.uint8)
             padded_digit = np.zeros((TEMPLATE_HEIGHT, max_w), dtype=np.uint8)
-            padded_template[:, :w_t] = template;
+            padded_template[:, :w_t] = template
             padded_digit[:, :w_s] = standardized_digit
             res = cv2.matchTemplate(padded_digit, padded_template, cv2.TM_CCOEFF_NORMED)
             score = res[0][0]
@@ -291,11 +137,13 @@ def recognize_score(image, templates):
     return score_str if score_str else None
 
 
+RETRY_BUTTON_ROI = (687, 864, 156, 98)
+
+
 def detect_retry_button(image, template):
     if template is None: return False
-    ROI = (687, 864, 156, 98)
-    margin = 10;
-    x, y, w, h = ROI
+    x, y, w, h = RETRY_BUTTON_ROI
+    margin = 10
     if y - margin < 0 or y + h + margin > image.shape[0] or x - margin < 0 or x + w + margin > image.shape[
         1]: return False
     search_area = image[y - margin: y + h + margin, x - margin: x + w + margin]
@@ -305,51 +153,49 @@ def detect_retry_button(image, template):
     return max_val > 0.8
 
 
-RETRY_BUTTON_ROI = (687, 864, 156, 98) # The button's location within the client area
-
 def send_key(hwnd, key):
-    """Sends a keypress to the game window."""
     try:
-        win32gui.SetForegroundWindow(hwnd); time.sleep(0.05)
-        pydirectinput.press(key); time.sleep(0.05)
-    except win32ui.error: pass
+        # Check if the window handle is still valid before using it
+        if hwnd and win32gui.IsWindow(hwnd):
+            win32gui.SetForegroundWindow(hwnd)
+            time.sleep(0.05)
+            pydirectinput.press(key)
+            time.sleep(0.05)
+    except (win32ui.error, win32gui.error) as e:
+        # This will catch errors like "Invalid window handle"
+        # and prevent the thread from crashing the main script.
+        # print(f"Input Error: Could not send key '{key}'. Reason: {e}")
+        pass
+
 
 def send_click(hwnd, click_pos):
-    """Moves to and clicks a specific screen coordinate."""
     try:
-        win32gui.SetForegroundWindow(hwnd); time.sleep(0.05)
+        win32gui.SetForegroundWindow(hwnd);
+        time.sleep(0.05)
         pydirectinput.moveTo(click_pos[0], click_pos[1])
-        pydirectinput.click(); time.sleep(0.05)
-    except win32ui.error: pass
+        pydirectinput.click();
+        time.sleep(0.05)
+    except win32ui.error:
+        pass
 
 
-# --- BACKGROUND VISION THREAD (UPGRADED) ---
-
-class VisionThread(threading.Thread):
-    def __init__(self, window_title):
-        super().__init__();
-        self.daemon = True;
+class VisionProducer(threading.Thread):
+    def __init__(self, window_title, output_queue):
+        super().__init__()
+        self.daemon = True
         self.window_title = window_title
+        self.output_queue = output_queue
+        self.running = True
         self.digit_templates = load_digit_templates()
         self.retry_template = cv2.imread('templates/retry_button.png')
         if self.retry_template is None: raise FileNotFoundError("Could not load 'templates/retry_button.png'")
-
-        self.LOWER_BOUND = np.array([118, 0, 0])
+        self.LOWER_BOUND = np.array([118, 0, 0]);
         self.UPPER_BOUND = np.array([119, 255, 255])
-        self.AREA_MIN = 1320
-        self.AREA_MAX = 5000
-        self.SEARCH_ZONE_Y_INTERCEPT = 310
+        self.AREA_MIN = 1320;
+        self.AREA_MAX = 2500
+        self.SEARCH_ZONE_Y_INTERCEPT = 310;
         self.PENALTY_LINE_Y_INTERCEPT = 720
         self.LINE_ANGLE_DEG = 15
-
-        self.lock = threading.Lock()
-        self.latest_frame = None;
-        self.latest_score = None
-        self.is_dead = False;
-        self.in_penalty_zone = False;
-        self.running = True
-        self.latest_chicken_box = None;
-        self.latest_penalty_line_pts = None
 
     def find_chicken(self, frame):
         hsv_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
@@ -376,90 +222,86 @@ class VisionThread(threading.Thread):
                                "width": client_right - client_left,
                                "height": client_bottom - client_top - TITLE_BAR_HEIGHT}
                     if monitor['width'] <= 0 or monitor['height'] <= 0: time.sleep(0.1); continue
-
                     game_frame = cv2.cvtColor(np.array(sct.grab(monitor)), cv2.COLOR_BGRA2BGR)
                     frame_h, frame_w, _ = game_frame.shape
-
                     score_val = recognize_score(game_frame.copy(), self.digit_templates)
                     death_detected = detect_retry_button(game_frame.copy(), self.retry_template)
-
                     angle_rad = math.radians(self.LINE_ANGLE_DEG);
                     slope = math.tan(angle_rad)
-                    search_y1 = self.SEARCH_ZONE_Y_INTERCEPT
+                    search_y1 = self.SEARCH_ZONE_Y_INTERCEPT;
                     search_y2 = int(slope * frame_w + search_y1)
                     search_mask = np.zeros(game_frame.shape[:2], dtype=np.uint8)
                     pts = np.array([[0, search_y1], [frame_w, search_y2], [frame_w, frame_h], [0, frame_h]],
                                    dtype=np.int32)
                     cv2.fillPoly(search_mask, [pts], 255)
                     search_area = cv2.bitwise_and(game_frame, game_frame, mask=search_mask)
-
                     chicken_pos, chicken_box = self.find_chicken(search_area)
-
                     penalty_detected = False
                     if chicken_pos:
                         cx, cy = chicken_pos
-                        # The cy coordinate from find_chicken is already in the full frame's coordinate system.
-                        # No adjustment is needed.
                         penalty_line_y_at_chicken = int(slope * cx + self.PENALTY_LINE_Y_INTERCEPT)
-                        if cy > penalty_line_y_at_chicken:
-                            penalty_detected = True
-
-                    # Calculate penalty line endpoints for visualization
-                    p_x1, p_y1 = 0, self.PENALTY_LINE_Y_INTERCEPT
+                        if cy > penalty_line_y_at_chicken: penalty_detected = True
+                    p_x1, p_y1 = 0, self.PENALTY_LINE_Y_INTERCEPT;
                     p_x2, p_y2 = frame_w, int(slope * frame_w + self.PENALTY_LINE_Y_INTERCEPT)
-                    penalty_line_pts = ((p_x1, p_y1), (p_x2, p_y2))
-
-                    with self.lock:
-                        self.latest_frame = game_frame;
-                        self.latest_score = score_val
-                        self.is_dead = death_detected;
-                        self.in_penalty_zone = penalty_detected
-                        self.latest_chicken_box = chicken_box
-                        self.latest_penalty_line_pts = penalty_line_pts
+                    result = {"frame": game_frame, "score": score_val, "is_dead": death_detected,
+                              "in_penalty_zone": penalty_detected, "chicken_box": chicken_box,
+                              "penalty_line_pts": ((p_x1, p_y1), (p_x2, p_y2))}
+                    try:
+                        self.output_queue.put_nowait(result)
+                    except queue.Full:
+                        pass
                 except Exception as e:
-                    print(f"Error in Vision Thread: {e}");
-                    time.sleep(1)
+                    print(f"Error in VisionProducer: {e}"); time.sleep(1)
 
     def stop(self):
         self.running = False
 
 
 # --- MAIN APPLICATION LOOP ---
-class GameState(Enum):
-    MENU = 1;
-    PLAYING = 2;
-
 
 def main():
-    WINDOW_TITLE = "Crossy Road";
-    TARGET_FPS = 60;
+    WINDOW_TITLE = "Crossy Road"
+    TARGET_FPS = 45
     FRAME_DELAY = 1.0 / TARGET_FPS
-    print("CrossyLearn Agent - Milestone 21: Learning Enabled")
-    print("--------------------------------------------------")
-    vision_thread = VisionThread(WINDOW_TITLE);
-    vision_thread.start()
-    agent = Agent();
-    game_state = GameState.MENU;
-    last_score = 0;
-    high_score = 0
-    penalty_timer = 0;
-    PENALTY_INTERVAL = 0.5
-    episode_num = 0
+    print("CrossyLearn Agent - Modern Architecture w/ Baseline Agent (Corrected)")
+    print("--------------------------------------------------------------------")
 
-    last_state, last_action = None, None
+    vision_queue = queue.Queue(maxsize=1)
+    vision_producer = VisionProducer(WINDOW_TITLE, vision_queue)
+    vision_producer.start()
+
+    agent = Agent()
+    game_state = GameState.MENU
+    last_score = 0
+    high_score = 0
+    episode_num = 0
+    penalty_timer = 0
+    PENALTY_INTERVAL = 0.25
+    frame = None
+    fps = 0
+    frame_count = 0
+    fps_time = time.time()
+
+    # --- BUG FIX: State tracking variable ---
+    was_dead = False
 
     while True:
         loop_start_time = time.time()
-        with vision_thread.lock:
-            frame = vision_thread.latest_frame;
-            score_str = vision_thread.latest_score
-            is_dead = vision_thread.is_dead;
-            in_penalty_zone = vision_thread.in_penalty_zone
-            chicken_box = vision_thread.latest_chicken_box
-            penalty_line_pts = vision_thread.latest_penalty_line_pts
+        try:
+            vision_data = vision_queue.get_nowait()
+        except queue.Empty:
+            if frame is None:
+                print("Waiting for first frame from VisionProducer...")
+                time.sleep(0.5)
+                continue
+            pass
 
-        if frame is None: print("Waiting for first frame..."); time.sleep(0.5); continue
-
+        frame = vision_data['frame']
+        score_str = vision_data['score']
+        is_dead = vision_data['is_dead']
+        in_penalty_zone = vision_data['in_penalty_zone']
+        chicken_box = vision_data['chicken_box']
+        penalty_line_pts = vision_data['penalty_line_pts']
         current_score = int(score_str) if score_str is not None and score_str.isdigit() else None
 
         hwnd = win32gui.FindWindow(None, WINDOW_TITLE)
@@ -469,96 +311,80 @@ def main():
             client_left, client_top = win32gui.ClientToScreen(hwnd, (left, top))
             window_geo = (client_left, client_top, 50)
 
-        # Agent acts and returns the state and action it took
-        current_state, current_action = agent.act(game_state, hwnd, window_geo, frame)
+        # Agent acts based on the CURRENT state. The agent now only clicks retry if is_dead is true.
+        if is_dead:
+            agent.act(game_state, hwnd, window_geo)
 
-        reward = 0
-        if game_state == GameState.PLAYING:
+        # --- Game State Machine (CORRECTED LOGIC) ---
+        if game_state == GameState.MENU:
+            # This is the key fix. A new game starts the frame AFTER we were dead, but are no longer.
+            if was_dead and not is_dead:
+                game_state = GameState.PLAYING
+                last_score = 0  # Reset score for the new run
+                episode_num += 1
+                print(f"\n--- NEW GAME (Episode {episode_num}) ---")
+                print(f"STATE CHANGE: MENU -> PLAYING (High Score: {high_score})")
+                agent.on_new_game()
+
+        elif game_state == GameState.PLAYING:
+            # Agent acts during the playing state
+            agent.act(game_state, hwnd, window_geo)
+
             if is_dead:
-                reward = -100
-                print(f"EVENT: Player has died! Score was {last_score}. Punishment: {reward}")
-                game_state = GameState.MENU;
+                print(f"EVENT: Player has died! Final score was {last_score}.")
+                game_state = GameState.MENU
                 print("STATE CHANGE: PLAYING -> MENU")
                 penalty_timer = 0
-                if last_state is not None and last_action is not None:
-                    # 'None' for next_state because the game has ended
-                    reward_tensor = torch.tensor([reward], device=DEVICE)
-                    agent.memory.push(last_state, last_action, None, reward_tensor)
-                last_state, last_action = None, None
-
-            else: # Still playing
-                # Score increase reward
+            else:
                 if current_score is not None and current_score > last_score:
-                    score_reward = 1
+                    print(f"EVENT: Score increased to {current_score}!")
                     if current_score > high_score:
-                        score_reward += 100
-                        print(f"EVENT: New high score! Jackpot Reward: +100");
+                        print(f"EVENT: New high score!")
                         high_score = current_score
-                    print(f"EVENT: Score increased to {current_score}! Reward: +{score_reward}")
-                    reward += score_reward
                     last_score = current_score
-
-                # Penalty zone punishment
                 if in_penalty_zone:
                     if penalty_timer == 0:
                         penalty_timer = time.time()
                     elif time.time() - penalty_timer > PENALTY_INTERVAL:
-                        penalty_punishment = -10
-                        print(f"EVENT: In penalty zone! Punishment: {penalty_punishment}");
-                        reward += penalty_punishment
+                        print(f"EVENT: In penalty zone!")
                         penalty_timer = time.time()
                 else:
                     penalty_timer = 0
 
-            # Store the experience in memory
-            if last_state is not None and last_action is not None:
-                reward_tensor = torch.tensor([reward], device=DEVICE)
-                agent.memory.push(last_state, last_action, current_state, reward_tensor)
+        # --- BUG FIX: Update was_dead at the END of the loop ---
+        was_dead = is_dead
 
-        # Transition to the next state
-        last_state, last_action = current_state, current_action
-
-        # Perform one step of the optimization (on the policy network)
-        agent.optimize_model()
-
-        if game_state == GameState.MENU:
-            if current_score is not None and not is_dead:
-                game_state = GameState.PLAYING;
-                last_score = current_score if current_score is not None else 0
-                episode_num += 1
-                print(f"\n--- NEW GAME (Episode {episode_num}) ---");
-                print(f"STATE CHANGE: MENU -> PLAYING (High Score: {high_score})")
-                agent.on_new_game()
-
-        # Update the target network, copying all weights and biases in the DQN
-        if agent.steps_done % TARGET_UPDATE == 0:
-            agent.update_target_net()
-
-
-        display_frame = frame.copy();
+        # --- Display ---
+        display_frame = frame.copy()
         font = cv2.FONT_HERSHEY_SIMPLEX
-        score_text = f"Score: {last_score if game_state == GameState.PLAYING else 'N/A'} | High Score: {high_score}"
-        text_size = cv2.getTextSize(score_text, font, 1, 2)[0];
-        text_x = (frame.shape[1] - text_size[0]) // 2
-        cv2.putText(display_frame, score_text, (text_x, 40), font, 1, (0, 255, 0), 2)
-        state_text = f"State: {game_state.name} | Episode: {episode_num}";
+        state_text = f"State: {game_state.name} | Episode: {episode_num}"
         cv2.putText(display_frame, state_text, (10, 40), font, 1, (0, 255, 0), 2)
-
-        if penalty_line_pts:
-            cv2.line(display_frame, penalty_line_pts[0], penalty_line_pts[1], (0, 0, 255), 2)
+        score_text = f"Score: {last_score if game_state == GameState.PLAYING else 'N/A'} | High Score: {high_score}"
+        text_size = cv2.getTextSize(score_text, font, 1, 2)[0]
+        text_x = (frame.shape[1] - text_size[0]) // 2
+        cv2.putText(display_frame, score_text, (text_x, 80), font, 1, (0, 255, 0), 2)
+        if penalty_line_pts: cv2.line(display_frame, penalty_line_pts[0], penalty_line_pts[1], (0, 0, 255), 2)
         if chicken_box and game_state == GameState.PLAYING:
             x, y, w, h = chicken_box
             cv2.rectangle(display_frame, (x, y), (x + w, y + h), (255, 0, 0), 2)
-
+        frame_count += 1
+        current_time = time.time()
+        if current_time - fps_time >= 1.0:
+            fps = frame_count;
+            frame_count = 0;
+            fps_time = current_time
+        cv2.putText(display_frame, f"FPS: {fps}", (10, 120), font, 0.7, (0, 255, 0), 2)
         cv2.imshow('CrossyLearn Vision', display_frame)
+
         if cv2.waitKey(1) & 0xFF == ord('q'): break
+
         elapsed_time = time.time() - loop_start_time
         sleep_duration = FRAME_DELAY - elapsed_time
         if sleep_duration > 0: time.sleep(sleep_duration)
 
-    print("Shutting down...");
-    vision_thread.stop();
-    vision_thread.join();
+    print("Shutting down...")
+    vision_producer.stop()
+    vision_producer.join()
     cv2.destroyAllWindows()
 
 

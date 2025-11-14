@@ -32,7 +32,7 @@ class DQNAgent:
         self.target_net.load_state_dict(self.policy_net.state_dict())
         self.target_net.eval()  # Target network is only for evaluation
 
-        self.optimizer = optim.AdamW(self.policy_net.parameters(), lr=LR, amsgrad=True)
+        self.optimizer = optim.RMSprop(self.policy_net.parameters(), lr=LR)
         self.memory = ReplayMemory(10000)  # Store up to 10,000 experiences
 
         self.steps_done = 0

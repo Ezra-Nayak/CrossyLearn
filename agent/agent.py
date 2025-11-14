@@ -37,25 +37,32 @@ class DQNAgent:
 
         self.steps_done = 0
 
-    def select_action(self, state):
+    def select_action(self, state, is_first_move=False):
         """
         Selects an action using an epsilon-greedy policy.
-        With probability epsilon, take a random action (explore).
-        Otherwise, take the best action according to the policy network (exploit).
+        For the first move of an episode, the 'left' action is forbidden.
         """
         sample = random.random()
         eps_threshold = EPS_END + (EPS_START - EPS_END) * \
                         math.exp(-1. * self.steps_done / EPS_DECAY)
         self.steps_done += 1
 
-        if sample > eps_threshold:
+        if sample > eps_threshold:  # Exploit
             with torch.no_grad():
-                # state.max(1) returns the largest value in each row of the tensor.
-                # .view(1, 1) reshapes it to the desired dimensions for the action.
-                return self.policy_net(state).max(1)[1].view(1, 1)
-        else:
-            # Return a random action
-            return torch.tensor([[random.randrange(self.n_actions)]], device=self.device, dtype=torch.long)
+                q_values = self.policy_net(state)
+                if is_first_move:
+                    # Action 1 ('left') is forbidden. Set its Q-value to negative infinity.
+                    q_values[0, 1] = -float('inf')
+                # Select the action with the highest Q-value from the (possibly modified) set.
+                return q_values.max(1)[1].view(1, 1)
+        else:  # Explore
+            if is_first_move:
+                # Choose from allowed actions: 0 (up), 2 (right), 3 (down)
+                action = random.choice([0, 2, 3])
+            else:
+                # Choose from all actions
+                action = random.randrange(self.n_actions)
+            return torch.tensor([[action]], device=self.device, dtype=torch.long)
 
     def optimize_model(self):
         """Performs one step of the optimization (learning)."""

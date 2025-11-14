@@ -3,14 +3,16 @@ import time
 from collections import deque
 import matplotlib.pyplot as plt
 import numpy as np
+import os
+from torch.utils.tensorboard import SummaryWriter
 
 from crossy_env import CrossyRoadEnv
 from agent.agent import DQNAgent, EPS_START, EPS_END, EPS_DECAY
 
 # --- CONFIGURATION ---
-NUM_EPISODES = 1000
-# This cooldown is critical to prevent the 'left' input from opening the menu
+NUM_EPISODES = 500
 POST_RESET_COOLDOWN = 2.0
+SAVE_EVERY_N_EPISODES = 50  # Checkpoint saving frequency
 
 
 def get_epsilon(steps_done):
@@ -19,7 +21,12 @@ def get_epsilon(steps_done):
 
 
 def main():
+    # --- SETUP ---
     env = CrossyRoadEnv()
+    writer = SummaryWriter()  # NEW: Initialize TensorBoard writer
+
+    # Create directories for saving models if they don't exist
+    os.makedirs('models', exist_ok=True)
 
     n_actions = env.action_space.n
     state, _ = env.reset()
@@ -30,24 +37,22 @@ def main():
     print("--- Starting Training ---")
     print(f"Agent will train for {NUM_EPISODES} episodes.")
     print(f"Device: {agent.device}")
+    print(f"TensorBoard logs at: ./runs")
 
     print("Performing initial reset to ensure clean start...")
     env.reset()
-    time.sleep(POST_RESET_COOLDOWN)  # Apply cooldown after initial reset too
+    time.sleep(POST_RESET_COOLDOWN)
 
     episode_scores = []
     episode_avg_losses = []
     recent_scores = deque(maxlen=100)
 
+    # --- MAIN TRAINING LOOP ---
     for i_episode in range(NUM_EPISODES):
         start_time = time.time()
 
-        # This brief sleep ensures the vision thread sees the death screen before we reset
         time.sleep(0.5)
         state, _ = env.reset()
-
-        # --- CRITICAL FIX: Wait for the game to be ready for input ---
-        print(f"Applying {POST_RESET_COOLDOWN}s post-reset cooldown...")
         time.sleep(POST_RESET_COOLDOWN)
 
         state = torch.tensor(state, dtype=torch.float32, device=agent.device).unsqueeze(0)
@@ -60,7 +65,6 @@ def main():
             action_tensor = agent.select_action(state, is_first_move)
             action_item = action_tensor.item()
 
-            # --- ASSERTION SAFETY NET ---
             if is_first_move:
                 assert action_item != 1, f"FATAL: Agent selected 'left' (1) on first move!"
                 is_first_move = False
@@ -83,15 +87,22 @@ def main():
 
             agent.update_target_net()
 
+        # --- LOGGING AND SAVING ---
         score = info.get('raw_score', 0)
+        duration = time.time() - start_time
+        avg_loss = np.mean(episode_losses) if episode_losses else 0
+        current_eps = get_epsilon(agent.steps_done)
+
         episode_scores.append(score)
         recent_scores.append(score)
+        avg_score = np.mean(recent_scores)
 
-        duration = time.time() - start_time
-        avg_score = sum(recent_scores) / len(recent_scores)
-        avg_loss = sum(episode_losses) / len(episode_losses) if episode_losses else 0
-        episode_avg_losses.append(avg_loss)
-        current_eps = get_epsilon(agent.steps_done)
+        # NEW: Log to TensorBoard
+        writer.add_scalar('Score/Episode', score, i_episode)
+        writer.add_scalar('Score/Average_100_Episodes', avg_score, i_episode)
+        writer.add_scalar('Loss/Average_Episode', avg_loss, i_episode)
+        writer.add_scalar('Meta/Epsilon', current_eps, i_episode)
+        writer.add_scalar('Meta/Episode_Duration', duration, i_episode)
 
         print(
             f"Ep {i_episode + 1} | "
@@ -102,31 +113,20 @@ def main():
             f"Duration: {duration:.2f}s"
         )
 
+        # NEW: Checkpoint saving
+        if (i_episode + 1) % SAVE_EVERY_N_EPISODES == 0:
+            model_path = f"models/crossy_agent_ep{i_episode + 1}.pth"
+            torch.save(agent.policy_net.state_dict(), model_path)
+            print(f"--- Checkpoint saved to {model_path} ---")
+
+    # --- CLEANUP ---
     print('--- Training Complete ---')
+    final_model_path = "models/crossy_agent_final.pth"
+    torch.save(agent.policy_net.state_dict(), final_model_path)
+    print(f"Final model saved to {final_model_path}")
+
     env.close()
-
-    plt.figure(figsize=(12, 5))
-
-    plt.subplot(1, 2, 1)
-    plt.title('Score per Episode')
-    plt.xlabel('Episode')
-    plt.ylabel('Score')
-    plt.plot(episode_scores, label='Score')
-    rolling_avg = [np.mean(episode_scores[max(0, i - 100):i + 1]) for i in range(len(episode_scores))]
-    plt.plot(rolling_avg, label='100-ep Average', color='orange')
-    plt.legend()
-
-    plt.subplot(1, 2, 2)
-    plt.title('Average Loss per Episode')
-    plt.xlabel('Episode')
-    plt.ylabel('Loss')
-    plt.plot(episode_avg_losses, label='Avg Loss', color='red')
-    rolling_avg_loss = [np.mean(episode_avg_losses[max(0, i - 100):i + 1]) for i in range(len(episode_avg_losses))]
-    plt.plot(rolling_avg_loss, label='100-ep Avg Loss', color='purple')
-    plt.legend()
-
-    plt.tight_layout()
-    plt.show()
+    writer.close()
 
 
 if __name__ == '__main__':

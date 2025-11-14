@@ -155,11 +155,16 @@ def detect_retry_button(image, template):
 
 def send_key(hwnd, key):
     try:
-        win32gui.SetForegroundWindow(hwnd);
-        time.sleep(0.05)
-        pydirectinput.press(key);
-        time.sleep(0.05)
-    except win32ui.error:
+        # Check if the window handle is still valid before using it
+        if hwnd and win32gui.IsWindow(hwnd):
+            win32gui.SetForegroundWindow(hwnd)
+            time.sleep(0.05)
+            pydirectinput.press(key)
+            time.sleep(0.05)
+    except (win32ui.error, win32gui.error) as e:
+        # This will catch errors like "Invalid window handle"
+        # and prevent the thread from crashing the main script.
+        # print(f"Input Error: Could not send key '{key}'. Reason: {e}")
         pass
 
 

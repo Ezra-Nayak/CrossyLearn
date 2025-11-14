@@ -104,10 +104,13 @@ def main():
         writer.add_scalar('Meta/Epsilon', current_eps, i_episode)
         writer.add_scalar('Meta/Episode_Duration', duration, i_episode)
 
+        status = info.get("status", "finished")
+
         print(
             f"Ep {i_episode + 1} | "
-            f"Score: {score} | "
-            f"Avg Score: {avg_score:.2f} | "
+            f"Status: {status.upper():<8} | "
+            f"Score: {score:<3} | "
+            f"Avg Score: {avg_score:<5.2f} | "
             f"Avg Loss: {avg_loss:.4f} | "
             f"Epsilon: {current_eps:.3f} | "
             f"Duration: {duration:.2f}s"

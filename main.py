@@ -187,7 +187,7 @@ class VisionProducer(threading.Thread):
         self.LOWER_BOUND = np.array([118, 0, 0]);
         self.UPPER_BOUND = np.array([119, 255, 255])
         self.AREA_MIN = 1320;
-        self.AREA_MAX = 5000
+        self.AREA_MAX = 2500
         self.SEARCH_ZONE_Y_INTERCEPT = 310;
         self.PENALTY_LINE_Y_INTERCEPT = 720
         self.LINE_ANGLE_DEG = 15

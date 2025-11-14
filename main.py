@@ -26,7 +26,7 @@ class Agent:
     def __init__(self):
         self.actions = ['up', 'left', 'right', 'down']
         self.last_action_time = 0
-        self.action_interval = 0.5  # Normal seconds between actions
+        self.action_interval = 0.25  # Normal seconds between actions
         self.new_game_cooldown = 2.5  # Special delay for the first action
         self.is_first_move = True
 
@@ -276,7 +276,7 @@ def main():
     high_score = 0
     episode_num = 0
     penalty_timer = 0
-    PENALTY_INTERVAL = 0.5
+    PENALTY_INTERVAL = 0.25
     frame = None
     fps = 0
     frame_count = 0

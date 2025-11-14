@@ -19,7 +19,7 @@ from collections import namedtuple, deque
 # --- DEEP LEARNING SETUP & MODEL ARCHITECTURE ---
 
 # Hyperparameters
-BATCH_SIZE = 128
+BATCH_SIZE = 32
 GAMMA = 0.99
 EPS_START = 0.9
 EPS_END = 0.05
@@ -257,7 +257,7 @@ def load_digit_templates():
 
 
 def recognize_score(image, templates):
-    SCORE_ROI = (10, 150, 10, 250);
+    SCORE_ROI = (10, 121, 10, 233)
     TEMPLATE_HEIGHT = 40
     roi = image[SCORE_ROI[0]:SCORE_ROI[1], SCORE_ROI[2]:SCORE_ROI[3]]
     gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
@@ -293,7 +293,7 @@ def recognize_score(image, templates):
 
 def detect_retry_button(image, template):
     if template is None: return False
-    ROI = (649, 1504, 156, 98);
+    ROI = (687, 864, 156, 98)
     margin = 10;
     x, y, w, h = ROI
     if y - margin < 0 or y + h + margin > image.shape[0] or x - margin < 0 or x + w + margin > image.shape[
@@ -305,7 +305,7 @@ def detect_retry_button(image, template):
     return max_val > 0.8
 
 
-RETRY_BUTTON_ROI = (649, 1504, 156, 98) # The button's location within the client area
+RETRY_BUTTON_ROI = (687, 864, 156, 98) # The button's location within the client area
 
 def send_key(hwnd, key):
     """Sends a keypress to the game window."""
@@ -336,10 +336,10 @@ class VisionThread(threading.Thread):
 
         self.LOWER_BOUND = np.array([118, 0, 0])
         self.UPPER_BOUND = np.array([119, 255, 255])
-        self.AREA_MIN = 1481
+        self.AREA_MIN = 1320
         self.AREA_MAX = 5000
-        self.SEARCH_ZONE_Y_INTERCEPT = 700
-        self.PENALTY_LINE_Y_INTERCEPT = 1285
+        self.SEARCH_ZONE_Y_INTERCEPT = 310
+        self.PENALTY_LINE_Y_INTERCEPT = 720
         self.LINE_ANGLE_DEG = 15
 
         self.lock = threading.Lock()

@@ -6,51 +6,101 @@ import win32gui
 import pydirectinput
 import time
 import math
-from standalone.terrain_analyzer import Terrain, get_terrain_type
+import subprocess
+import os
+from standalone.terrain_analyzer import Terrain, TERRAIN_HSV_RANGES
 
-# --- GAME CONSTANTS ---
+# --- CONFIGURATION ---
 WINDOW_TITLE = "Crossy Road"
-# Vision Tuning (From your final_verify.py)
+EXECUTABLE_PATH = r"C:\Program Files\WindowsApps\Yodo1Ltd.CrossyRoad_1.3.4.0_x86__s3s3f300emkze\Crossy Road.exe"
+
+# Vision Constants
 LOWER_BOUND = np.array([170, 125, 21])
 UPPER_BOUND = np.array([179, 136, 37])
 SEARCH_ZONE_Y_INTERCEPT = 310
 LINE_ANGLE_DEG = 15
-PENALTY_Y_LIMIT = 850  # If chicken drops below this, assume Eagle Death
 
-# Isometric Vectors (From your feeler_visualiser.py)
+# Eagle Death Line (Slanted)
+EAGLE_Y_INTERCEPT = 850
+
+# Isometric Vectors
 FORWARD_VEC = np.array([28, -70])
 RIGHT_VEC = np.array([80, 20])
 PATCH_SIZE = 4
 
-# Retry Button (From retry_click_verifier.py)
 RETRY_CLICK_COORDS = (767, 912)
+
+
+class GameCrashedError(Exception):
+    pass
 
 
 class CrossyEnv:
     def __init__(self):
         self.sct = mss.mss()
+        self.action_space = 4  # 0:Idle, 1:Up, 2:Left, 3:Right
+        self.grid_radius = 3
+        self.state_dim = ((self.grid_radius * 2 + 1) ** 2) + 1
+        self.steps_in_episode = 0
+
+        # Pre-calculate slopes
+        angle_rad = math.radians(LINE_ANGLE_DEG)
+        self.slope = math.tan(angle_rad)
+
+        # Ensure game is open on init
+        self._ensure_game_running()
+
+    def _ensure_game_running(self):
         self.hwnd = win32gui.FindWindow(None, WINDOW_TITLE)
         if not self.hwnd:
-            raise Exception("Game window not found!")
+            print("[ENV] Game window not found. Launching application...")
+            try:
+                # Attempt to launch. Note: launching into WindowsApps folder often requires
+                # special handling or 'explorer.exe shell:AppsFolder\...' but we try direct first.
+                if os.path.exists(EXECUTABLE_PATH):
+                    subprocess.Popen(EXECUTABLE_PATH)
+                else:
+                    # Fallback: Try generic start (sometimes works for registered Appx)
+                    os.system(f'start "" "{EXECUTABLE_PATH}"')
 
-        # Action Space: 0: Idle, 1: Forward, 2: Left, 3: Right
-        # Note: Backward is rarely useful and dangerous, excluded for faster training V1
-        self.action_space = 4
+                # Wait for load
+                print("[ENV] Waiting 10 seconds for startup...")
+                time.sleep(10)
 
-        # State Space:
-        # Grid 5x5 around chicken (25 ints) + Normalized Y Pos (1 float)
-        self.grid_radius = 3  # Look 3 tiles ahead, 3 tiles wide
-        self.state_dim = ((self.grid_radius * 2 + 1) ** 2) + 1
+                self.hwnd = win32gui.FindWindow(None, WINDOW_TITLE)
+                if not self.hwnd:
+                    raise Exception("Failed to launch game or find window after launch.")
+
+                # Get it to the main menu
+                print("[ENV] Pressing Space to pass splash screen...")
+                time.sleep(2)
+                self._focus_window()
+                pydirectinput.press('space')
+                time.sleep(2)
+
+            except Exception as e:
+                print(f"[ENV] Critical Error launching game: {e}")
+                raise e
+
+    def _focus_window(self):
+        if self.hwnd:
+            try:
+                win32gui.SetForegroundWindow(self.hwnd)
+            except:
+                pass
 
     def get_window_geometry(self):
-        left, top, right, bottom = win32gui.GetClientRect(self.hwnd)
-        client_point = win32gui.ClientToScreen(self.hwnd, (left, top))
-        return {
-            "top": client_point[1] + 50,  # Title bar
-            "left": client_point[0],
-            "width": right - left,
-            "height": bottom - top - 50
-        }
+        try:
+            left, top, right, bottom = win32gui.GetClientRect(self.hwnd)
+            client_point = win32gui.ClientToScreen(self.hwnd, (left, top))
+            return {
+                "top": client_point[1] + 50,
+                "left": client_point[0],
+                "width": right - left,
+                "height": bottom - top - 50
+            }
+        except Exception:
+            raise GameCrashedError("Window handle invalid")
 
     def grab_frame(self):
         monitor = self.get_window_geometry()
@@ -59,12 +109,10 @@ class CrossyEnv:
         return cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
 
     def find_chicken(self, frame):
-        # Angled Mask Logic
         h, w, _ = frame.shape
-        angle_rad = math.radians(LINE_ANGLE_DEG)
-        slope = math.tan(angle_rad)
 
-        search_y2 = int(slope * w + SEARCH_ZONE_Y_INTERCEPT)
+        # Angled Search Mask
+        search_y2 = int(self.slope * w + SEARCH_ZONE_Y_INTERCEPT)
         search_mask = np.zeros(frame.shape[:2], dtype=np.uint8)
         pts = np.array([[0, SEARCH_ZONE_Y_INTERCEPT], [w, search_y2], [w, h], [0, h]], dtype=np.int32)
         cv2.fillPoly(search_mask, [pts], 255)
@@ -74,35 +122,39 @@ class CrossyEnv:
         mask = cv2.inRange(hsv, LOWER_BOUND, UPPER_BOUND)
 
         contours, _ = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-        if not contours: return None
+        valid = [c for c in contours if cv2.contourArea(c) > 10]
 
-        # Filter tiny noise
-        valid = [c for c in contours if cv2.contourArea(c) > 10]  # Threshold from your logs
         if not valid: return None
-
         c = max(valid, key=cv2.contourArea)
         x, y, w, h = cv2.boundingRect(c)
-        return (x + w // 2, y + h)  # Feet position
+        return (x + w // 2, y + h)
+
+    def check_eagle_death(self, chicken_pos, frame_w):
+        """
+        Returns True if chicken is below the angled eagle line.
+        Line Eq: y = slope * x + 850
+        """
+        cx, cy = chicken_pos
+        eagle_line_y = int(self.slope * cx + EAGLE_Y_INTERCEPT)
+
+        # In CV2, Y increases downwards.
+        # If cy > eagle_line_y, we are BELOW the line (visually lower/closer to eagle).
+        return cy > eagle_line_y
 
     def get_state(self, frame, chicken_pos):
         if not chicken_pos:
-            # If lost, return zero grid
-            return np.zeros(self.state_dim)
+            return np.zeros(self.state_dim), []
 
         cx, cy = chicken_pos
         grid_data = []
+        debug_patches = []
 
-        # Scan a grid around the chicken
-        # Range: -3 to +3
+        # OPTIMIZATION: Convert full frame to HSV once, instead of 49 times
+        hsv_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+
         r = self.grid_radius
-        for dy_grid in range(-r, r + 1):  # Front to Back
-            for dx_grid in range(-r, r + 1):  # Left to Right
-
-                # Calculate pixel offset using Isometric Vectors
-                # Forward is -Y in grid, Right is +X in grid
-                # P = Chicken + (RightVec * dx) + (ForwardVec * dy)
-                # Note: In grid, usually +y is up (forward).
-
+        for dy_grid in range(-r, r + 1):
+            for dx_grid in range(-r, r + 1):
                 offset = (RIGHT_VEC * dx_grid) + (FORWARD_VEC * -dy_grid)
                 px, py = int(cx + offset[0]), int(cy + offset[1])
 
@@ -110,22 +162,32 @@ class CrossyEnv:
 
                 # Boundary check
                 if 0 <= py < frame.shape[0] and 0 <= px < frame.shape[1]:
-                    # Extract patch
+                    # Extract HSV Patch directly
                     y1, y2 = max(0, py - PATCH_SIZE), min(frame.shape[0], py + PATCH_SIZE)
                     x1, x2 = max(0, px - PATCH_SIZE), min(frame.shape[1], px + PATCH_SIZE)
-                    patch = frame[y1:y2, x1:x2]
-                    t_type = get_terrain_type(patch)
+
+                    if y2 > y1 and x2 > x1:
+                        patch_hsv = hsv_frame[y1:y2, x1:x2]
+
+                        # Fast Terrain Check (Inline)
+                        avg_hsv = np.mean(patch_hsv, axis=(0, 1))
+                        h_val, s_val, v_val = avg_hsv
+
+                        for terrain, (lower, upper) in TERRAIN_HSV_RANGES.items():
+                            if (lower[0] <= h_val <= upper[0] and
+                                    lower[1] <= s_val <= upper[1] and
+                                    lower[2] <= v_val <= upper[2]):
+                                t_type = terrain
+                                break
 
                 grid_data.append(int(t_type))
+                debug_patches.append((px, py, t_type))
 
-        # Append Normalized Y position (Danger sensing)
         norm_y = cy / frame.shape[0]
         grid_data.append(norm_y)
-
-        return np.array(grid_data)
+        return np.array(grid_data), debug_patches
 
     def is_pause_visible(self, frame):
-        # Logic from pause_roi_debugger.py
         h, w, _ = frame.shape
         roi_w = int(w * 0.08)
         roi_h = int(h * 0.06)
@@ -141,39 +203,49 @@ class CrossyEnv:
         return valid_bars == 2
 
     def reset(self):
-        print("ENV: Resetting...")
+        self.steps_in_episode = 0
+        self._ensure_game_running()
 
-        # 1. Check if we are effectively dead
-        frame = self.grab_frame()
-        if self.is_pause_visible(frame):
-            # If we are alive, force death (for training consistency) or restart logic
-            # For now, assume we call reset() only when dead.
-            pass
-
-        # 2. Click Retry
         monitor = self.get_window_geometry()
         tx = monitor['left'] + RETRY_CLICK_COORDS[0]
         ty = monitor['top'] + RETRY_CLICK_COORDS[1]
 
-        win32gui.SetForegroundWindow(self.hwnd)
+        self._focus_window()
         time.sleep(0.1)
         pydirectinput.moveTo(tx, ty)
         pydirectinput.click()
         time.sleep(0.5)
         pydirectinput.press('space')
-        time.sleep(1.5)  # Wait for start animation
+        time.sleep(1.5)
 
-        # 3. Get initial state
         frame = self.grab_frame()
         pos = self.find_chicken(frame)
-        if not pos:
-            # Fallback if vision fails on start
-            pos = (frame.shape[1] // 2, frame.shape[0] // 2)
+        if not pos: pos = (frame.shape[1] // 2, frame.shape[0] // 2)
 
-        return self.get_state(frame, pos)
+        state, self.last_debug_grid = self.get_state(frame, pos)
+        return state
 
     def step(self, action):
-        # Actions: 0:Idle, 1:Fwd, 2:Left, 3:Right
+        # 1. Crash Check
+        if not win32gui.IsWindow(self.hwnd):
+            raise GameCrashedError("Window lost during step")
+
+        # 2. Get current position BEFORE moving (for eagle check)
+        frame_initial = self.grab_frame()
+        pos_initial = self.find_chicken(frame_initial)
+
+        # 3. Eagle Check / Input Cutoff
+        if pos_initial:
+            if self.check_eagle_death(pos_initial, frame_initial.shape[1]):
+                # CUT INPUTS. Accept Death.
+                print("[ENV] Eagle Line Crossed! Cutting inputs.")
+                return np.zeros(self.state_dim), -10, True
+
+        # 4. Execute Action
+        # Masking logic happens in trainer, but we double check here:
+        if self.steps_in_episode == 0 and action == 2:
+            print("[ENV] Warning: 'Left' attempted on first move. Ignoring.")
+            action = 0  # Force Idle
 
         if action == 1:
             pydirectinput.press('up')
@@ -182,44 +254,77 @@ class CrossyEnv:
         elif action == 3:
             pydirectinput.press('right')
 
-        # Small delay for animation to start
-        time.sleep(0.15)
+        self.steps_in_episode += 1
 
+        # 5. Sense Result
         frame = self.grab_frame()
         pos = self.find_chicken(frame)
 
-        # --- REWARD LOGIC ---
-        reward = 0
         done = False
+        reward = 0
 
-        # 1. Death Check (Pause missing OR Y too low)
         is_alive = self.is_pause_visible(frame)
-        y_limit_breached = False
 
-        if pos:
-            if pos[1] > PENALTY_Y_LIMIT:
-                y_limit_breached = True
-        else:
-            # If pos is None, we might be "squished" or dead
-            # If pause button is ALSO gone, definitely dead
-            if not is_alive:
-                done = True
+        # Post-move Eagle check
+        eagle_death = False
+        if pos and self.check_eagle_death(pos, frame.shape[1]):
+            eagle_death = True
 
-        if not is_alive or y_limit_breached:
+        if not is_alive or eagle_death:
             done = True
             reward = -10
         else:
-            # Alive Reward
             if action == 1:
-                reward = 1.0  # Incentive to move forward
+                reward = 1.0
             elif action == 0:
-                reward = -0.1  # Penalty for idling
+                reward = -0.1
             else:
-                reward = -0.01  # Small cost for side movement
+                reward = -0.01
+            if pos: reward += (1.0 - (pos[1] / frame.shape[0])) * 0.5
 
-            # Positional Reward (Higher on screen = better)
-            if pos:
-                reward += (1.0 - (pos[1] / frame.shape[0])) * 0.5
+        state, self.last_debug_grid = self.get_state(frame, pos)
 
-        next_state = self.get_state(frame, pos)
-        return next_state, reward, done
+        # 6. Render Debug Window
+        self.render_debug(frame, pos, eagle_death)
+
+        return state, reward, done
+
+    def render_debug(self, frame, chicken_pos, eagle_death):
+        display = frame.copy()
+        h, w, _ = display.shape
+
+        # Draw Eagle Line
+        y1 = EAGLE_Y_INTERCEPT
+        y2 = int(self.slope * w + EAGLE_Y_INTERCEPT)
+        cv2.line(display, (0, y1), (w, y2), (0, 0, 255), 2)
+
+        # Draw Grid
+        if self.last_debug_grid:
+            for (px, py, t_type) in self.last_debug_grid:
+                color = (200, 200, 200)
+                if t_type == Terrain.GRASS:
+                    color = (0, 255, 0)
+                elif t_type == Terrain.ROAD:
+                    color = (50, 50, 50)
+                elif t_type == Terrain.WATER:
+                    color = (255, 100, 0)
+                elif t_type == Terrain.RAIL:
+                    color = (0, 0, 100)
+                cv2.circle(display, (px, py), 4, color, -1)
+
+        # Draw Stats
+        cv2.putText(display, f"Step: {self.steps_in_episode}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255),
+                    2)
+
+        status = "ALIVE"
+        if eagle_death:
+            status = "EAGLE DEATH"
+        elif not self.is_pause_visible(frame):
+            status = "DEAD"
+
+        cv2.putText(display, status, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                    (0, 0, 255) if "DEAD" in status else (0, 255, 0), 2)
+
+        # Resize for desktop viewing if needed
+        cv2.imshow("CrossyLearn Debug", display)
+        cv2.waitKey(1)

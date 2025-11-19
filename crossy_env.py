@@ -15,8 +15,10 @@ WINDOW_TITLE = "Crossy Road"
 EXECUTABLE_PATH = r"C:\Program Files\WindowsApps\Yodo1Ltd.CrossyRoad_1.3.4.0_x86__s3s3f300emkze\Crossy Road.exe"
 
 # Vision Constants
-LOWER_BOUND = np.array([170, 125, 21])
-UPPER_BOUND = np.array([179, 136, 37])
+LOWER_BOUND = np.array([175, 150, 230])
+UPPER_BOUND = np.array([178, 150, 230])
+AREA_MIN = 35
+AREA_MAX = 185
 SEARCH_ZONE_Y_INTERCEPT = 310
 LINE_ANGLE_DEG = 15
 
@@ -122,7 +124,9 @@ class CrossyEnv:
         mask = cv2.inRange(hsv, LOWER_BOUND, UPPER_BOUND)
 
         contours, _ = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-        valid = [c for c in contours if cv2.contourArea(c) > 10]
+
+        # Filter by MIN and MAX area
+        valid = [c for c in contours if AREA_MIN < cv2.contourArea(c) < AREA_MAX]
 
         if not valid: return None
         c = max(valid, key=cv2.contourArea)

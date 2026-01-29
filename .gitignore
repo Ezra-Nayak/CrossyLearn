@@ -1,1 +1,5 @@
 /checkpoints/
+/reference_architecture/
+/logs
+/data
+/crossy_final.pth

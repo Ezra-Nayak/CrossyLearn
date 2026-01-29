@@ -20,11 +20,20 @@ if not os.path.exists(DATA_DIR):
 
 def process_frame(frame):
     """
-    1. Grayscale
-    2. Resize to 160x160
-    3. Normalize 0-1
+    1. CROP: Removes the top 15% (UI, Score, Pause Button).
+    2. GRAYSCALE.
+    3. RESIZE: To 160x160.
+    4. NORMALIZE: 0-1.
     """
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    h, w, _ = frame.shape
+
+    # --- THE CUT ---
+    # Crop top 15% (Approx 150px on a 1000px height)
+    crop_h = int(h * 0.15)
+    cropped = frame[crop_h:, :]
+    # ----------------
+
+    gray = cv2.cvtColor(cropped, cv2.COLOR_BGR2GRAY)
     resized = cv2.resize(gray, (IMG_SIZE, IMG_SIZE), interpolation=cv2.INTER_AREA)
     return resized / 255.0
 

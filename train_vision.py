@@ -10,11 +10,11 @@ import glob
 import matplotlib.pyplot as plt
 
 # --- CONFIG ---
-BATCH_SIZE = 64
-LR = 2e-4
-EPOCHS = 30
-LATENT_DIM = 64  # Increased to 64 (32 Context + 32 Trend)
-IMG_SIZE = 160  # Updated size
+BATCH_SIZE = 128        # Crank this up for stability
+LR = 1e-4               # Slightly lower for fine-tuning
+EPOCHS = 350            # Let it run for a while
+LATENT_DIM = 64
+IMG_SIZE = 160
 STACK_SIZE = 4
 CHECKPOINT_DIR = "checkpoints"
 LOG_DIR = "logs"
@@ -220,10 +220,15 @@ def train():
             optimizer.step()
 
             total_loss += loss.item()
+        if epoch % 50 == 0 or epoch == 1:
+            print(f"Epoch {epoch} | Loss: {total_loss / len(dataloader):.4f}")
 
-        print(f"Epoch {epoch} | Loss: {total_loss / len(dataloader):.4f}")
+        if epoch % 50 == 0 or epoch == 1:
+            verify_vae(model, dataloader, epoch)
 
-        verify_vae(model, dataloader, epoch)
+        if epoch % 100 == 0:
+            torch.save(model.state_dict(), f"{CHECKPOINT_DIR}/crossy_vae_ep{epoch}.pth")
+            print(f"[SAVE] Permanent checkpoint saved at epoch {epoch}")
         torch.save(model.state_dict(), f"{CHECKPOINT_DIR}/crossy_vae_latest.pth")
 
 

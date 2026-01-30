@@ -36,7 +36,12 @@ IMG_SIZE = 160
 # --- CONFIG ---
 VAE_CHECKPOINT = "checkpoints/crossy_vae_latest.pth"
 WINDOW_TITLE = "Crossy Road"
-DEVICE = setup_device()
+
+# HYBRID COMPUTE SETUP
+# VAE (Images) -> GPU (DirectML) for Speed
+# PPO (Logic)  -> CPU for Stability (Fixes DirectML Scatter/Backward Crash)
+VAE_DEVICE = setup_device()
+PPO_DEVICE = torch.device("cpu")
 
 
 class Memory:
@@ -101,9 +106,10 @@ class ActorCritic(nn.Module):
 
 class PPO:
     def __init__(self, state_dim, action_dim):
-        self.policy = ActorCritic(state_dim, action_dim).to(DEVICE)
+        # Force PPO to CPU
+        self.policy = ActorCritic(state_dim, action_dim).to(PPO_DEVICE)
         self.optimizer = optim.Adam(self.policy.parameters(), lr=LR)
-        self.policy_old = ActorCritic(state_dim, action_dim).to(DEVICE)
+        self.policy_old = ActorCritic(state_dim, action_dim).to(PPO_DEVICE)
         self.policy_old.load_state_dict(self.policy.state_dict())
         self.MseLoss = nn.MSELoss()
 
@@ -116,13 +122,14 @@ class PPO:
             discounted_reward = reward + (GAMMA * discounted_reward)
             rewards.insert(0, discounted_reward)
 
-        # Normalize rewards
-        rewards = torch.tensor(rewards, dtype=torch.float32).to(DEVICE)
+        # Normalize rewards (CPU)
+        rewards = torch.tensor(rewards, dtype=torch.float32).to(PPO_DEVICE)
         rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-7)
 
-        old_states = torch.squeeze(torch.stack(memory.states, dim=0)).detach().to(DEVICE)
-        old_actions = torch.squeeze(torch.stack(memory.actions, dim=0)).detach().to(DEVICE)
-        old_logprobs = torch.squeeze(torch.stack(memory.logprobs, dim=0)).detach().to(DEVICE)
+        # Stack tensors (CPU)
+        old_states = torch.squeeze(torch.stack(memory.states, dim=0)).detach().to(PPO_DEVICE)
+        old_actions = torch.squeeze(torch.stack(memory.actions, dim=0)).detach().to(PPO_DEVICE)
+        old_logprobs = torch.squeeze(torch.stack(memory.logprobs, dim=0)).detach().to(PPO_DEVICE)
 
         for _ in range(K_EPOCHS):
             logprobs, state_values, dist_entropy = self.policy.evaluate(old_states, old_actions)
@@ -145,8 +152,8 @@ class PPO:
 
 class CrossyGameEnv:
     def __init__(self):
-        self.vae = SplitBrainVAE().to(DEVICE)
-        self.vae.load_state_dict(torch.load(VAE_CHECKPOINT, map_location=DEVICE))
+        self.vae = SplitBrainVAE().to(VAE_DEVICE)
+        self.vae.load_state_dict(torch.load(VAE_CHECKPOINT, map_location=VAE_DEVICE))
         self.vae.eval()
 
         self.vision_q = queue.Queue(maxsize=1)
@@ -170,8 +177,8 @@ class CrossyGameEnv:
                 os.system(f'start "" "{EXECUTABLE_PATH}"')
 
                 # Wait for load (WindowsApps can be slow)
-                print("[RECOVERY] Waiting 15 seconds for startup...")
-                time.sleep(15)
+                print("[RECOVERY] Waiting 9 seconds for startup...")
+                time.sleep(9)
 
                 self.hwnd = win32gui.FindWindow(None, WINDOW_TITLE)
                 if not self.hwnd:
@@ -223,7 +230,7 @@ class CrossyGameEnv:
                 self.frame_buffer.append(processed)
 
         stack = np.array(self.frame_buffer, dtype=np.float32)
-        tensor_in = torch.FloatTensor(stack).unsqueeze(0).to(DEVICE)
+        tensor_in = torch.FloatTensor(stack).unsqueeze(0).to(VAE_DEVICE)
 
         with torch.no_grad():
             _, _, mu_c, _, mu_t, _ = self.vae(tensor_in)
@@ -351,21 +358,38 @@ class CrossyGameEnv:
         return next_state, reward, done, info
 
 
+import glob
+
+
 def train():
     env = CrossyGameEnv()
-
-    # State dim = 64 (Latent) + 2 (XY) = 66
-    # Action dim = 4
     ppo = PPO(66, 4)
     memory = Memory()
 
-    print("--- STARTING PPO TRAINING ---")
+    start_episode = 1
+
+    # --- AUTO RESUME LOGIC ---
+    checkpoints = glob.glob("checkpoints/ppo_crossy_*.pth")
+    if checkpoints:
+        # Find the one with the highest number
+        latest_cp = max(checkpoints, key=lambda x: int(x.split('_')[-1].split('.')[0]))
+        print(f"[RESUME] Loading checkpoint: {latest_cp}")
+
+        # Load weights
+        ppo.policy.load_state_dict(torch.load(latest_cp, map_location=PPO_DEVICE))
+        ppo.policy_old.load_state_dict(ppo.policy.state_dict())
+
+        # Parse episode number
+        start_episode = int(latest_cp.split('_')[-1].split('.')[0]) + 1
+        print(f"[RESUME] Resuming from Episode {start_episode}")
+    else:
+        print("--- STARTING NEW TRAINING SESSION ---")
     print("Focus the game window!")
     time.sleep(3)
 
     time_step = 0
 
-    for i_episode in range(1, MAX_EPISODES + 1):
+    for i_episode in range(start_episode, MAX_EPISODES + 1):
         state = env.reset()
         current_ep_reward = 0
 
@@ -373,23 +397,23 @@ def train():
         for t in range(1000):
             time_step += 1
 
-            # Select Action
-            state_t = torch.FloatTensor(state).to(DEVICE)
+            # Select Action (Move state to CPU for PPO)
+            state_t = torch.FloatTensor(state).to(PPO_DEVICE)
             action, logprob = ppo.policy_old.act(state_t)
 
             # Execute
             next_state, reward, done, _ = env.step(action)
 
-            # Handle Step Failure (e.g. game crashed mid-episode)
+            # Handle Step Failure
             if next_state is None:
-                print("[PPO] Step failed (Game Crash?). Forcing Reset...")
+                print("[PPO] Step failed. Resetting...")
                 done = True
-                reward = -10.0 # Penalty for crashing/losing state
+                reward = -10.0
 
-            # Store
+            # Store (CPU)
             memory.states.append(state_t)
-            memory.actions.append(torch.tensor(action).to(DEVICE))
-            memory.logprobs.append(torch.tensor(logprob).to(DEVICE))
+            memory.actions.append(torch.tensor(action).to(PPO_DEVICE))
+            memory.logprobs.append(torch.tensor(logprob).to(PPO_DEVICE))
             memory.rewards.append(reward)
             memory.is_terminals.append(done)
 
@@ -409,7 +433,7 @@ def train():
         print(f"Ep {i_episode} | Reward: {current_ep_reward:.2f} | Score: {env.last_score}")
 
         # Save Checkpoint
-        if i_episode % 20 == 0:
+        if i_episode % 50 == 0:
             torch.save(ppo.policy.state_dict(), f"checkpoints/ppo_crossy_{i_episode}.pth")
 
 

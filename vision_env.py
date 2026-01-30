@@ -64,10 +64,7 @@ class VisionEnv:
         4. NORMALIZE: 0-1.
         """
         h, w, _ = frame.shape
-
-        # --- THE CUT ---
-        # Crop top 15% (Approx 150px on a 1000px height)
-        crop_h = int(h * 0.15)
+        crop_h = int(h * 0.16)
         cropped = frame[crop_h:, :]
         # ----------------
 

@@ -10,7 +10,7 @@ from train_vision import SplitBrainVAE, setup_device
 
 # --- CONFIG ---
 WINDOW_TITLE = "Crossy Road"
-VAE_CHECKPOINT = "checkpoints/crossy_vae_latest.pth"
+VAE_CHECKPOINT = "checkpoints/crossy_vae_ep500_KLD.pth"
 IMG_SIZE = 160
 STACK_SIZE = 4
 LATENT_DIM = 64
@@ -19,7 +19,7 @@ LATENT_DIM = 64
 def process_frame(frame):
     # MATCH THIS TO YOUR COLLECT_DATA SCRIPT!
     h, w, _ = frame.shape
-    crop_h = int(h * 0.15)  # The 15% Crop
+    crop_h = int(h * 0.16) # The 16% Crop
     cropped = frame[crop_h:, :]
     gray = cv2.cvtColor(cropped, cv2.COLOR_BGR2GRAY)
     resized = cv2.resize(gray, (IMG_SIZE, IMG_SIZE), interpolation=cv2.INTER_AREA)

@@ -12,7 +12,7 @@ import matplotlib.pyplot as plt
 # --- CONFIG ---
 BATCH_SIZE = 128        # Crank this up for stability
 LR = 1e-4               # Slightly lower for fine-tuning
-EPOCHS = 350            # Let it run for a while
+EPOCHS = 1000            # Let it run for a while
 LATENT_DIM = 64
 IMG_SIZE = 160
 STACK_SIZE = 4
@@ -212,8 +212,10 @@ def train():
             kld += -0.5 * torch.sum(1 + log_t - mu_t.pow(2) - log_t.exp())
             kld /= (BATCH_SIZE * 2)
 
-            # Weight KLD much lower (1e-5) to fix checkerboard noise
-            loss = loss_context + (2.0 * loss_trend) + (0.00001 * kld)
+            # EXPERIMENTAL: Increased KLD to structure the latent space better.
+            # If images turn gray/checkerboard, lower this back to 0.00001
+            KLD_WEIGHT = 0.00001
+            loss = loss_context + (2.0 * loss_trend) + (KLD_WEIGHT * kld)
 
             optimizer.zero_grad()
             loss.backward()
@@ -229,7 +231,7 @@ def train():
         if epoch % 100 == 0:
             torch.save(model.state_dict(), f"{CHECKPOINT_DIR}/crossy_vae_ep{epoch}.pth")
             print(f"[SAVE] Permanent checkpoint saved at epoch {epoch}")
-        torch.save(model.state_dict(), f"{CHECKPOINT_DIR}/crossy_vae_latest.pth")
+        torch.save(model.state_dict(), f"{CHECKPOINT_DIR}/crossy_vae_latest_KLD.pth")
 
 
 if __name__ == "__main__":

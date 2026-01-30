@@ -28,8 +28,8 @@ def process_frame(frame):
     h, w, _ = frame.shape
 
     # --- THE CUT ---
-    # Crop top 15% (Approx 150px on a 1000px height)
-    crop_h = int(h * 0.15)
+    # Crop top 16% (Ensures Pause button edge is fully removed, Approx 160px on a 1000px height)
+    crop_h = int(h * 0.16)
     cropped = frame[crop_h:, :]
     # ----------------
 

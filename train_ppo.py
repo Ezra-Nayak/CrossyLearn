@@ -162,8 +162,9 @@ class CrossyGameEnv:
 
         self.frame_buffer = deque(maxlen=STACK_SIZE)
         self.last_score = 0
+        self.next_milestone = 10 # Tracks the next +5 reward target
         self.steps_stationary = 0
-        self.steps_in_episode = 0 # NEW: Tracks moves in current run
+        self.steps_in_episode = 0
         self.last_known_coords = (0.5, 0.8)
         self.sct = mss.mss()
         self._ensure_game_running()
@@ -198,7 +199,7 @@ class CrossyGameEnv:
 
     def process_frame(self, frame):
         h, w, _ = frame.shape
-        crop_h = int(h * 0.15)
+        crop_h = int(h * 0.16)
         cropped = frame[crop_h:, :]
         gray = cv2.cvtColor(cropped, cv2.COLOR_BGR2GRAY)
         resized = cv2.resize(gray, (IMG_SIZE, IMG_SIZE), interpolation=cv2.INTER_AREA)
@@ -287,6 +288,7 @@ class CrossyGameEnv:
         # 3. Clear memory for new run
         self.frame_buffer.clear()
         self.last_score = 0
+        self.next_milestone = 10 # Reset milestone counter
         self.steps_stationary = 0
         self.steps_in_episode = 0
         self.last_known_coords = (0.5, 0.8)  # Reset coords to safe default
@@ -331,12 +333,23 @@ class CrossyGameEnv:
         next_state, score, is_alive, info = self.get_state()
 
         # --- REWARD ENGINEERING ---
-        reward = -0.01  # Existence penalty
+        # REDUCED: Allow the agent to be patient.
+        # Old: -0.01. New: -0.002.
+        # It can now wait 5x longer before feeling the same "pain".
+        reward = -0.002
         done = False
 
         # 1. Progression Reward
         if score > self.last_score:
-            reward += 1.0 * (score - self.last_score)
+            reward += 1.5 * (score - self.last_score)
+
+            # --- MILESTONE BONUS ---
+            if score >= self.next_milestone:
+                reward += 5.0
+                print(f"[BONUS] Milestone reached! Score: {score}")
+                self.next_milestone += 10
+            # -----------------------
+
             self.last_score = score
             self.steps_stationary = 0
 

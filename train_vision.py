@@ -231,7 +231,7 @@ def train():
         if epoch % 100 == 0:
             torch.save(model.state_dict(), f"{CHECKPOINT_DIR}/crossy_vae_ep{epoch}.pth")
             print(f"[SAVE] Permanent checkpoint saved at epoch {epoch}")
-        torch.save(model.state_dict(), f"{CHECKPOINT_DIR}/crossy_vae_latest_KLD.pth")
+        torch.save(model.state_dict(), f"{CHECKPOINT_DIR}/crossy_vae_latest.pth")
 
 
 if __name__ == "__main__":

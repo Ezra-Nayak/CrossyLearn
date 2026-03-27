@@ -14,6 +14,7 @@ import pydirectinput
 from collections import deque
 from train_vision import SplitBrainVAE, setup_device
 from vision import VisionSystem
+from tracker import RamTracker
 
 import subprocess
 import os
@@ -160,12 +161,14 @@ class CrossyGameEnv:
         self.vis = VisionSystem(WINDOW_TITLE, self.vision_q, show_preview=False)
         self.vis.start()
 
+        self.ram_tracker = RamTracker()
+
         self.frame_buffer = deque(maxlen=STACK_SIZE)
         self.last_score = 0
         self.next_milestone = 10 # Tracks the next +5 reward target
         self.steps_stationary = 0
         self.steps_in_episode = 0
-        self.last_known_coords = (0.5, 0.8)
+        self.last_known_coords = (0.0, 0.0)
         self.sct = mss.mss()
         self._ensure_game_running()
 
@@ -218,7 +221,6 @@ class CrossyGameEnv:
             return None, 0, True, {}  # Fail state
 
         frame = data['frame']
-        score_str = data['score']
 
         # 2. Process VAE Input
         processed = self.process_frame(frame)
@@ -237,29 +239,21 @@ class CrossyGameEnv:
             _, _, mu_c, _, mu_t, _ = self.vae(tensor_in)
             latents = torch.cat([mu_c, mu_t], dim=1).cpu().numpy().flatten()
 
-        # 3. Proprioception (Chicken XY)
-        # --- MODIFIED COORDINATE LOGIC ---
-        cx, cy = self.last_known_coords # Start with memory
+        # 3. Proprioception & Score (RAM Tracking)
+        # Fetch coordinates automatically bypassing CV completely
+        coords = self.ram_tracker.get_coords()
+        if coords:
+            raw_x, raw_y, raw_z = coords
+            # Grid align to prevent jump animation jitter (1.0 units per tile)
+            grid_x = round(raw_x)
+            grid_z = round(raw_z)
+            self.last_known_coords = (grid_x, grid_z)
 
-        if data['chicken_pos']:
-            # We have a lock (or a coast), update memory
-            cx = data['chicken_pos'][0] / frame.shape[1]
-            cy = data['chicken_pos'][1] / frame.shape[0]
-            self.last_known_coords = (cx, cy)
-        else:
-            # Tracker is totally LOST (behind truck for >10 frames).
-            # We keep using self.last_known_coords.
-            # This simulates "Object Permanence" - we assume it's where we last saw it.
-            pass
+        # State is VAE Latents + Grid X + Grid Z
+        state_vec = np.concatenate([latents,[self.last_known_coords[0], self.last_known_coords[1]]])
 
-        state_vec = np.concatenate([latents, [cx, cy]])
-
-        # 4. Score Logic
-        current_score = 0
-        try:
-            if score_str: current_score = int(score_str)
-        except:
-            pass
+        # Use Z axis directly as the continuous score (progress tracker)
+        current_score = self.last_known_coords[1]
 
         return state_vec, current_score, data['pause_visible'], data
 
@@ -287,22 +281,22 @@ class CrossyGameEnv:
 
         # 3. Clear memory for new run
         self.frame_buffer.clear()
-        self.last_score = 0
-        self.next_milestone = 10 # Reset milestone counter
         self.steps_stationary = 0
         self.steps_in_episode = 0
-        self.last_known_coords = (0.5, 0.8)  # Reset coords to safe default
+        self.last_known_coords = (0.0, 0.0)
 
         # 4. WAIT FOR GAME START (Sync Logic)
         # We loop here until the Vision System confirms the Pause Button is visible.
-        # This prevents "Ghost Episodes" where the agent acts while the menu is fading out.
         timeout_start = time.time()
         while time.time() - timeout_start < 5.0:  # 5 second timeout
             time.sleep(0.1)
-            state, _, is_alive, _ = self.get_state()
+            state, z_score, is_alive, _ = self.get_state()
 
             # If vision is working AND game thinks we are alive:
             if state is not None and is_alive:
+                # Sync initial score properly so it doesn't instantly penalize/reward
+                self.last_score = z_score
+                self.next_milestone = self.last_score + 10
                 return state
 
         # If we reach here, the game didn't start (missed click?). Retry reset.
@@ -339,26 +333,33 @@ class CrossyGameEnv:
         reward = -0.002
         done = False
 
-        # 1. Progression Reward
+        # 1. Progression Reward (Using Z Coordinate)
         if score > self.last_score:
+            # Z increases by ~2.0 per hop forward
             reward += 1.5 * (score - self.last_score)
 
             # --- MILESTONE BONUS ---
             if score >= self.next_milestone:
                 reward += 5.0
-                print(f"[BONUS] Milestone reached! Score: {score}")
+                print(f"[BONUS] Milestone reached! Z-Score: {score}")
                 self.next_milestone += 10
             # -----------------------
 
             self.last_score = score
             self.steps_stationary = 0
+        elif score < self.last_score:
+            # INNOVATION: Penalize stepping backward directly utilizing the Z coordinate!
+            reward -= 0.5 * (self.last_score - score)
+            self.last_score = score
+            self.steps_stationary = 0
 
-        # 2. Idle Penalty / Backward Penalty
+        # 2. Idle Penalty / Sideways Penalty
         if action == 0:
             reward -= 0.1
             self.steps_stationary += 1
         elif action == 2 or action == 3:
-            # Moving sideways is okay but not great
+            # Moving sideways is okay but not great, unless it dodges an obstacle.
+            # VAE will learn the dodge context.
             reward -= 0.05
 
         # 3. Death Detection

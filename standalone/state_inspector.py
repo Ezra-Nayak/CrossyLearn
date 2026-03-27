@@ -4,6 +4,7 @@ import cv2
 import queue
 import time
 from vision import VisionSystem
+from tracker import RamTracker
 
 
 def main():
@@ -17,6 +18,8 @@ def main():
     # We disable the internal preview of vision.py so we can draw our own custom debug info here
     vision = VisionSystem(WINDOW_TITLE, vision_queue, show_preview=False)
     vision.start()
+
+    ram_tracker = RamTracker()
 
     # Logic State
     current_state = "UNKNOWN"
@@ -50,7 +53,7 @@ def main():
 
             # --- Draw Inspector HUD ---
             # Opaque background
-            cv2.rectangle(display, (0, 0), (400, 200), (0, 0, 0), -1)
+            cv2.rectangle(display, (0, 0), (450, 220), (0, 0, 0), -1)
 
             # 1. State
             color = (0, 255, 0) if current_state == "PLAYING" else (0, 0, 255)
@@ -65,8 +68,23 @@ def main():
             cv2.putText(display, f"Retry Visible: {retry_visible}", (10, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.7, r_color,
                         2)
 
-            # 4. Score
-            cv2.putText(display, f"Score Read: {score}", (10, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2)
+            # 4. RAM Tracker Coordinates & Z-Score
+            coords = ram_tracker.get_coords()
+            if coords:
+                raw_x, raw_y, raw_z = coords
+                # Crossy Road's grid is exactly 1.0 unit per tile
+                grid_x = round(raw_x)
+                grid_z = round(raw_z)
+
+                ram_text = f"RAM Pos: X:{grid_x} | Z:{grid_z}"
+                cv2.putText(display, ram_text, (10, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2)
+
+                # Show raw jump height just to verify the hook is reading continuous memory
+                cv2.putText(display, f"Raw Y (Jump): {raw_y:.2f}", (10, 180), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                            (200, 200, 200), 1)
+            else:
+                cv2.putText(display, "RAM: INJECTING/SEARCHING...", (10, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.8,
+                            (0, 0, 255), 2)
 
             # 5. FPS
             frame_count += 1

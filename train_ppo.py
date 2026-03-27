@@ -30,8 +30,8 @@ EPS_CLIP = 0.2
 K_EPOCHS = 4
 UPDATE_TIMESTEP = 2000
 MAX_EPISODES = 10000
-HIDDEN_DIM = 256
-LATENT_DIM = 64
+HIDDEN_DIM = 512    # Increased to handle the larger 256 latent vector
+LATENT_DIM = 256    # SYNCED with train_vision.py
 STACK_SIZE = 4
 IMG_SIZE = 160
 
@@ -275,7 +275,9 @@ class CrossyGameEnv:
         tensor_in = torch.FloatTensor(stack).unsqueeze(0).to(VAE_DEVICE)
 
         with torch.no_grad():
+            # Original VAE returns: recon_static, pred_next, mu_c, log_c, mu_t, log_t
             _, _, mu_c, _, mu_t, _ = self.vae(tensor_in)
+            # Concatenate Context (128) and Trend (128) = 256
             latents = torch.cat([mu_c, mu_t], dim=1).cpu().numpy().flatten()
 
         # 3. Proprioception & Score (RAM Tracking)
@@ -383,7 +385,7 @@ class CrossyGameEnv:
         # 1. Progression Reward (Using Z Coordinate)
         if score > self.last_score:
             # Z increases by exactly 1.0 per grid hop forward
-            reward += 1.5 * (score - self.last_score)
+            reward += 2.0 * (score - self.last_score)  # Slightly more aggressive progress reward
 
             # --- MILESTONE BONUS ---
             if score >= self.next_milestone:
@@ -395,14 +397,15 @@ class CrossyGameEnv:
             self.last_score = score
             self.steps_stationary = 0
         elif score < self.last_score:
-            # INNOVATION: Penalize stepping backward directly utilizing the Z coordinate!
-            reward -= 0.5 * (self.last_score - score)
+            # INNOVATION: Penalize stepping backward.
+            # We use 2.0 to match the forward reward, making "back-and-forth" a net zero or loss.
+            reward -= 2.0 * (self.last_score - score)
             self.last_score = score
             self.steps_stationary = 0
 
         # 2. Idle Penalty / Sideways Penalty
         if action == 0:
-            reward -= 0.005  # SOTA: Allow agent to be patient. Was -0.1.
+            reward -= 0.015  # SOTA: Allow agent to be patient. Was -0.1.
             self.steps_stationary += 1
         elif action == 2 or action == 3:
             reward -= 0.001  # Almost negligible, allows tactical dodging.
@@ -420,8 +423,8 @@ import glob
 
 def train():
     env = CrossyGameEnv()
-    # State Dim is now 65 (64 Latent + 1 Normalized X)
-    ppo = PPO(65, 4)
+    # State Dim is now 257 (256 Latents + 1 Normalized X)
+    ppo = PPO(257, 4)
     memory = Memory()
 
     start_episode = 1

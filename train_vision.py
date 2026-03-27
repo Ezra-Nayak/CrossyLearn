@@ -2,18 +2,69 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.optim as optim
+import math
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
 import os
 import glob
 import matplotlib.pyplot as plt
 
+import torch.optim as optim
+from torch.optim import Optimizer
+
+
+class DMLAdam(Optimizer):
+    """
+    DirectML-Compatible Adam Optimizer.
+    Replaces the 'lerp' operator (unsupported on DML GPU) with basic add/mul.
+    """
+
+    def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8):
+        defaults = dict(lr=lr, betas=betas, eps=eps)
+        super(DMLAdam, self).__init__(params, defaults)
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            for p in group['params']:
+                if p.grad is None: continue
+                grad = p.grad
+                state = self.state[p]
+
+                # State initialization
+                if len(state) == 0:
+                    state['step'] = 0
+                    state['exp_avg'] = torch.zeros_like(p)
+                    state['exp_avg_sq'] = torch.zeros_like(p)
+
+                exp_avg, exp_avg_sq = state['exp_avg'], state['exp_avg_sq']
+                beta1, beta2 = group['betas']
+                state['step'] += 1
+
+                # Decay the first and second moment running average coefficient
+                # SOTA Fix: Replace lerp_ with mul_ and add_ for DML support
+                exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
+                exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
+
+                bias_correction1 = 1 - beta1 ** state['step']
+                bias_correction2 = 1 - beta2 ** state['step']
+
+                denom = (exp_avg_sq.sqrt() / math.sqrt(bias_correction2)).add_(group['eps'])
+                step_size = group['lr'] / bias_correction1
+
+                p.addcdiv_(exp_avg, denom, value=-step_size)
+        return loss
+
 # --- CONFIG ---
 BATCH_SIZE = 128        # Crank this up for stability
 LR = 1e-4               # Slightly lower for fine-tuning
 EPOCHS = 1000            # Let it run for a while
-LATENT_DIM = 64
+LATENT_DIM = 256
 IMG_SIZE = 160
 STACK_SIZE = 4
 CHECKPOINT_DIR = "checkpoints"
@@ -191,7 +242,9 @@ def train():
 
     dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
     model = SplitBrainVAE().to(DEVICE)
-    optimizer = optim.Adam(model.parameters(), lr=LR)
+
+    # SOTA: Use custom DMLAdam to bypass the unsupported 'lerp' kernel on DirectML GPUs.
+    optimizer = DMLAdam(model.parameters(), lr=LR)
 
     print(f"[TRAIN] Starting on {DEVICE} with {len(dataset)} samples.")
 

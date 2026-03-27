@@ -101,7 +101,7 @@ def train():
         print(f"Epoch {epoch} | Loss: {total_loss / len(loader):.5f}")
 
         if epoch % 20 == 0:
-            torch.save(model.state_dict(), "checkpoints/pathfinder_latest.pth")
+            torch.save(model.state_dict(), "imp_backups/pathfinder_latest.pth")
 
 
 if __name__ == "__main__":

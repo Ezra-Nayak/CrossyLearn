@@ -14,7 +14,7 @@ import queue
 # --- CONFIG ---
 WINDOW_TITLE = "Crossy Road"
 VAE_CP = "checkpoints/crossy_vae_latest.pth"
-PATH_CP = "checkpoints/pathfinder_latest.pth"
+PATH_CP = "imp_backups/pathfinder_latest.pth"
 DEVICE = setup_device()
 
 

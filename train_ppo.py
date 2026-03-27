@@ -25,6 +25,7 @@ RETRY_BUTTON_COORDS = (767, 862) # Standard Retry button
 # --- HYPERPARAMETERS ---
 LR = 3e-4
 GAMMA = 0.99
+GAE_LAMBDA = 0.95  # SOTA GAE Advantage smoothing
 EPS_CLIP = 0.2
 K_EPOCHS = 4
 UPDATE_TIMESTEP = 2000
@@ -48,10 +49,12 @@ PPO_DEVICE = torch.device("cpu")
 class Memory:
     def __init__(self):
         self.actions = []
-        self.states = []
+        self.states =[]
         self.logprobs = []
         self.rewards = []
-        self.is_terminals = []
+        self.is_terminals =[]
+        self.values = []
+        self.action_masks =[]
 
     def clear(self):
         del self.actions[:]
@@ -59,48 +62,65 @@ class Memory:
         del self.logprobs[:]
         del self.rewards[:]
         del self.is_terminals[:]
+        del self.values[:]
+        del self.action_masks[:]
+
+
+def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
+    torch.nn.init.orthogonal_(layer.weight, std)
+    torch.nn.init.constant_(layer.bias, bias_const)
+    return layer
 
 
 class ActorCritic(nn.Module):
     def __init__(self, state_dim, action_dim):
         super(ActorCritic, self).__init__()
 
-        # State Dim = 64 (VAE) + 2 (XY Coords) = 66
-        self.layer_common = nn.Sequential(
-            nn.Linear(state_dim, HIDDEN_DIM),
-            nn.Tanh(),
-            nn.Linear(HIDDEN_DIM, HIDDEN_DIM),
-            nn.Tanh()
-        )
-
+        # SOTA: Disjoint networks prevent destructive interference between Actor and Critic
         self.actor = nn.Sequential(
-            nn.Linear(HIDDEN_DIM, action_dim),
-            nn.Softmax(dim=-1)
+            layer_init(nn.Linear(state_dim, HIDDEN_DIM)),
+            nn.Tanh(),
+            layer_init(nn.Linear(HIDDEN_DIM, HIDDEN_DIM)),
+            nn.Tanh(),
+            layer_init(nn.Linear(HIDDEN_DIM, action_dim), std=0.01)  # Low std for initial exploration
         )
 
         self.critic = nn.Sequential(
-            nn.Linear(HIDDEN_DIM, 1)
+            layer_init(nn.Linear(state_dim, HIDDEN_DIM)),
+            nn.Tanh(),
+            layer_init(nn.Linear(HIDDEN_DIM, HIDDEN_DIM)),
+            nn.Tanh(),
+            layer_init(nn.Linear(HIDDEN_DIM, 1), std=1.0)
         )
 
     def forward(self):
         raise NotImplementedError
 
-    def act(self, state):
-        x = self.layer_common(state)
-        action_probs = self.actor(x)
-        dist = Categorical(action_probs)
+    def act(self, state, action_mask):
+        action_logits = self.actor(state)
+
+        # Action Masking: Add massive negative penalty to logits of invalid actions
+        if action_mask is not None:
+            action_logits = action_logits + action_mask
+
+        # Passing logits directly is numerically more stable than explicit Softmax
+        dist = Categorical(logits=action_logits)
         action = dist.sample()
         action_logprob = dist.log_prob(action)
-        return action.item(), action_logprob.item()
+        state_value = self.critic(state)
 
-    def evaluate(self, state, action):
-        x = self.layer_common(state)
-        action_probs = self.actor(x)
-        dist = Categorical(action_probs)
+        return action.item(), action_logprob.item(), state_value.item()
 
+    def evaluate(self, state, action, action_mask):
+        action_logits = self.actor(state)
+
+        if action_mask is not None:
+            action_logits = action_logits + action_mask
+
+        dist = Categorical(logits=action_logits)
         action_logprobs = dist.log_prob(action)
         dist_entropy = dist.entropy()
-        state_values = self.critic(x)
+        state_values = self.critic(state)
 
         return action_logprobs, state_values, dist_entropy
 
@@ -115,34 +135,53 @@ class PPO:
         self.MseLoss = nn.MSELoss()
 
     def update(self, memory):
-        rewards = []
-        discounted_reward = 0
-        for reward, is_terminal in zip(reversed(memory.rewards), reversed(memory.is_terminals)):
-            if is_terminal:
-                discounted_reward = 0
-            discounted_reward = reward + (GAMMA * discounted_reward)
-            rewards.insert(0, discounted_reward)
+        # SOTA: Generalized Advantage Estimation (GAE)
+        advantages = []
+        last_gae_lam = 0
 
-        # Normalize rewards (CPU)
-        rewards = torch.tensor(rewards, dtype=torch.float32).to(PPO_DEVICE)
-        rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-7)
+        for step in reversed(range(len(memory.rewards))):
+            if step == len(memory.rewards) - 1:
+                next_non_terminal = 1.0 - memory.is_terminals[step]
+                next_value = 0.0
+            else:
+                next_non_terminal = 1.0 - memory.is_terminals[step]
+                next_value = memory.values[step + 1]
+
+            delta = memory.rewards[step] + GAMMA * next_value * next_non_terminal - memory.values[step]
+            last_gae_lam = delta + GAMMA * GAE_LAMBDA * next_non_terminal * last_gae_lam
+            advantages.insert(0, last_gae_lam)
+
+        returns = [adv + val for adv, val in zip(advantages, memory.values)]
+
+        # Convert to tensors
+        returns = torch.tensor(returns, dtype=torch.float32).to(PPO_DEVICE)
+        advantages = torch.tensor(advantages, dtype=torch.float32).to(PPO_DEVICE)
+
+        # Normalize advantages
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
         # Stack tensors (CPU)
         old_states = torch.squeeze(torch.stack(memory.states, dim=0)).detach().to(PPO_DEVICE)
         old_actions = torch.squeeze(torch.stack(memory.actions, dim=0)).detach().to(PPO_DEVICE)
         old_logprobs = torch.squeeze(torch.stack(memory.logprobs, dim=0)).detach().to(PPO_DEVICE)
+        old_masks = torch.squeeze(torch.stack(memory.action_masks, dim=0)).detach().to(PPO_DEVICE)
 
         for _ in range(K_EPOCHS):
-            logprobs, state_values, dist_entropy = self.policy.evaluate(old_states, old_actions)
+            logprobs, state_values, dist_entropy = self.policy.evaluate(old_states, old_actions, old_masks)
             state_values = torch.squeeze(state_values)
 
             ratios = torch.exp(logprobs - old_logprobs)
-            advantages = rewards - state_values.detach()
 
+            # Actor loss
             surr1 = ratios * advantages
             surr2 = torch.clamp(ratios, 1 - EPS_CLIP, 1 + EPS_CLIP) * advantages
+            actor_loss = -torch.min(surr1, surr2)
 
-            loss = -torch.min(surr1, surr2) + 0.5 * self.MseLoss(state_values, rewards) - 0.01 * dist_entropy
+            # Critic loss
+            critic_loss = 0.5 * self.MseLoss(state_values, returns)
+
+            # Total loss
+            loss = actor_loss + critic_loss - 0.01 * dist_entropy
 
             self.optimizer.zero_grad()
             loss.mean().backward()
@@ -249,13 +288,23 @@ class CrossyGameEnv:
             grid_z = round(raw_z)
             self.last_known_coords = (grid_x, grid_z)
 
-        # State is VAE Latents + Grid X + Grid Z
-        state_vec = np.concatenate([latents,[self.last_known_coords[0], self.last_known_coords[1]]])
+        # SOTA Normalization: Remove Z (infinitely scaling score) from State.
+        # Normalize X (approx bounds -4 to 4) by dividing by 5.0 to map it tightly to [-1, 1]
+        norm_x = self.last_known_coords[0] / 5.0
+        state_vec = np.concatenate([latents, [norm_x]])
+
+        # Action Masking: 0:Idle, 1:Up, 2:Left, 3:Right
+        # Prevent the agent from walking off the visible map edges
+        action_mask = np.zeros(4, dtype=np.float32)
+        if self.last_known_coords[0] <= -4:
+            action_mask[2] = -1e8  # Heavily penalize Left
+        elif self.last_known_coords[0] >= 4:
+            action_mask[3] = -1e8  # Heavily penalize Right
 
         # Use Z axis directly as the continuous score (progress tracker)
         current_score = self.last_known_coords[1]
 
-        return state_vec, current_score, data['pause_visible'], data
+        return state_vec, current_score, data['pause_visible'], action_mask
 
     def reset(self):
         # 1. Crash Check
@@ -290,14 +339,14 @@ class CrossyGameEnv:
         timeout_start = time.time()
         while time.time() - timeout_start < 5.0:  # 5 second timeout
             time.sleep(0.1)
-            state, z_score, is_alive, _ = self.get_state()
+            state, z_score, is_alive, action_mask = self.get_state()
 
             # If vision is working AND game thinks we are alive:
             if state is not None and is_alive:
                 # Sync initial score properly so it doesn't instantly penalize/reward
                 self.last_score = z_score
                 self.next_milestone = self.last_score + 10
-                return state
+                return state, action_mask
 
         # If we reach here, the game didn't start (missed click?). Retry reset.
         return self.reset()
@@ -324,18 +373,16 @@ class CrossyGameEnv:
         # Latency Wait
         time.sleep(0.08)  # 80ms reaction time
 
-        next_state, score, is_alive, info = self.get_state()
+        next_state, score, is_alive, action_mask = self.get_state()
 
         # --- REWARD ENGINEERING ---
-        # REDUCED: Allow the agent to be patient.
-        # Old: -0.01. New: -0.002.
-        # It can now wait 5x longer before feeling the same "pain".
+        # BASE STEP PENALTY: Super small. Agent can survive and wait for cars to pass.
         reward = -0.002
         done = False
 
         # 1. Progression Reward (Using Z Coordinate)
         if score > self.last_score:
-            # Z increases by ~2.0 per hop forward
+            # Z increases by exactly 1.0 per grid hop forward
             reward += 1.5 * (score - self.last_score)
 
             # --- MILESTONE BONUS ---
@@ -355,21 +402,17 @@ class CrossyGameEnv:
 
         # 2. Idle Penalty / Sideways Penalty
         if action == 0:
-            reward -= 0.1
+            reward -= 0.005  # SOTA: Allow agent to be patient. Was -0.1.
             self.steps_stationary += 1
         elif action == 2 or action == 3:
-            # Moving sideways is okay but not great, unless it dodges an obstacle.
-            # VAE will learn the dodge context.
-            reward -= 0.05
+            reward -= 0.001  # Almost negligible, allows tactical dodging.
 
         # 3. Death Detection
-        # Rely on 'pause_visible' (True = Alive, False = Dead/Menu)
-        # Wait, if pause button is missing, we are likely dead.
         if not is_alive:
             reward = -10.0
             done = True
 
-        return next_state, reward, done, info
+        return next_state, reward, done, action_mask
 
 
 import glob
@@ -377,7 +420,8 @@ import glob
 
 def train():
     env = CrossyGameEnv()
-    ppo = PPO(66, 4)
+    # State Dim is now 65 (64 Latent + 1 Normalized X)
+    ppo = PPO(65, 4)
     memory = Memory()
 
     start_episode = 1
@@ -404,7 +448,7 @@ def train():
     time_step = 0
 
     for i_episode in range(start_episode, MAX_EPISODES + 1):
-        state = env.reset()
+        state, action_mask = env.reset()
         current_ep_reward = 0
 
         # Safety Loop Break
@@ -413,10 +457,12 @@ def train():
 
             # Select Action (Move state to CPU for PPO)
             state_t = torch.FloatTensor(state).to(PPO_DEVICE)
-            action, logprob = ppo.policy_old.act(state_t)
+            mask_t = torch.FloatTensor(action_mask).to(PPO_DEVICE)
+
+            action, logprob, value = ppo.policy_old.act(state_t, mask_t)
 
             # Execute
-            next_state, reward, done, _ = env.step(action)
+            next_state, reward, done, next_action_mask = env.step(action)
 
             # Handle Step Failure
             if next_state is None:
@@ -430,8 +476,11 @@ def train():
             memory.logprobs.append(torch.tensor(logprob).to(PPO_DEVICE))
             memory.rewards.append(reward)
             memory.is_terminals.append(done)
+            memory.values.append(value)
+            memory.action_masks.append(mask_t)
 
             state = next_state
+            action_mask = next_action_mask
             current_ep_reward += reward
 
             # Update Policy

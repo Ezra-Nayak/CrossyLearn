@@ -301,9 +301,10 @@ class VisionSystem(threading.Thread):
                         cv2.waitKey(1)
 
                     try:
-                        # Standardize to 10 FPS:
-                        # This ensures the Vision thread produces exactly 10 states per second.
-                        time.sleep(0.1)
+                        # Standardize to 10 FPS (100ms cycle)
+                        # We subtract a small amount (15ms) to account for capture overhead
+                        # and ensure the PPO loop stays synced at 10.0 FPS.
+                        time.sleep(0.085)
                         self.output_queue.put_nowait(result)
                     except queue.Full:
                         pass

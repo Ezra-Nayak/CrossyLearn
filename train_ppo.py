@@ -64,10 +64,62 @@ class TrainingUI:
         self.layout = Layout(name="root")
         self.log_messages = deque(maxlen=20)
         self.start_time = time.time()
-        self.last_update_time = 0
 
         # Stats
         self.best_score = 0
+        self.episodes_completed = 0
+        self.total_steps = 0
+        self.policy_updates = 0
+        self.recent_scores = deque(maxlen=50)
+
+        # Latency Metrics (ms)
+        self.vae_latency = 0.0
+        self.ppo_latency = 0.0
+        self.env_latency = 0.0
+
+        # Plotting Data Tracking
+        self.all_scores = []
+        self.all_rewards = []
+
+        # Telemetry state
+        self.current_ep = 0
+        self.current_step = 0
+        self.current_score = 0
+        self.last_action = "Idle"
+        self.current_reward = 0.0
+        self.game_state = "UNKNOWN"
+        self.ram_x = 0
+        self.ram_z = 0
+        self.fps = 0.0
+        self.action_mask_status = ""
+
+        self._setup_layout()
+
+    def _setup_layout(self):
+        self.layout.split(
+            Layout(name="header", size=3),
+            Layout(name="main", ratio=1),
+            Layout(name="footer", size=3),
+        )
+        self.layout["main"].split_row(
+            Layout(name="side", size=40),
+            Layout(name="body", ratio=2)
+        )
+        self.layout["side"].split(
+            Layout(name="config", size=11),
+            Layout(name="stats")
+        )
+        self.layout["body"].split(
+            Layout(name="telemetry", size=15),
+            Layout(name="log")
+        )
+
+        self.layout["header"].update(
+            Panel(Align.center("[bold]CROSSY ROAD PPO AGENT[/bold]"), style="bold cyan", border_style="cyan"))
+        self.layout["footer"].update(
+            Panel(Align.center("[dim]Training in progress... Press CTRL+C to abort & save plots[/dim]"),
+                  border_style="cyan"))
+        self.update()
         self.episodes_completed = 0
         self.total_steps = 0
         self.policy_updates = 0
@@ -115,7 +167,7 @@ class TrainingUI:
         self.layout["footer"].update(
             Panel(Align.center("[dim]Training in progress... Press CTRL+C to abort & save plots[/dim]"),
                   border_style="cyan"))
-        self.update(force=True)
+        self.update()
 
     def log(self, message):
         timestamp = datetime.now().strftime("%H:%M:%S")
@@ -156,39 +208,37 @@ class TrainingUI:
 
     def get_telemetry_table(self):
         table = Table(box=None, show_header=False, expand=True)
-        table.add_column(style="bold dim", width=15)
+        table.add_column(style="bold dim", width=16)
         table.add_column()
 
         state_color = "green" if self.game_state == "PLAYING" else "red"
 
+        # Standardization breakdown
+        budget_used = self.vae_latency + self.ppo_latency + self.env_latency
+        budget_color = "green" if budget_used < 100 else "red"  # 100ms is the 10fps budget
+
         table.add_row("Game State:", f"[{state_color}]{self.game_state}[/{state_color}]")
-        table.add_row("Current Ep:", str(self.current_ep))
-        table.add_row("Ep Step:", str(self.current_step))
-        table.add_row("RAM Pos:", f"X: {self.ram_x} | Z: {self.ram_z}")
-        table.add_row("Z-Score:", f"[bold yellow]{self.current_score}[/bold yellow]")
+        table.add_row("Loop FPS:", f"[bold cyan]{self.fps:.1f}[/bold cyan] / 10.0")
+        table.add_row("VAE Latency:", f"{self.vae_latency:.1f} ms")
+        table.add_row("PPO Latency:", f"{self.ppo_latency:.1f} ms")
+        table.add_row("Env Latency:", f"{self.env_latency:.1f} ms")
+        table.add_row("Total Cycle:", f"[{budget_color}]{budget_used:.1f} ms[/ {budget_color}]")
+        table.add_row("Z-Score:", f"[bold yellow]{self.current_score}[/bold yellow] (X: {self.ram_x:.1f})")
         table.add_row("Last Action:", f"[bold cyan]{self.last_action}[/bold cyan]")
-        table.add_row("Mask Status:", self.action_mask_status)
         table.add_row("Ep Reward:", f"{self.current_reward:.2f}")
-        table.add_row("Loop FPS:", f"{self.fps:.1f} (Decisions/sec)")
 
         return table
 
-    def update(self, force=False):
-        now = time.time()
-        # THROTTLE: Prevents the layout from being entirely reconstructed too fast (fixes flickering)
-        if not force and now - self.last_update_time < 0.2:
-            return
-        self.last_update_time = now
-
-        self.layout["config"].update(
-            Panel(self.get_config_table(), title="[bold]Configuration[/bold]", border_style="blue"))
-        self.layout["stats"].update(
-            Panel(self.get_stats_table(), title="[bold]Performance[/bold]", border_style="magenta"))
+    def update(self):
+        # We removed the throttle. To fix flickering, we ensure the Panel titles
+        # and borders are consistent. The 'Live' context in train() will handle refresh.
+        self.layout["config"].update(Panel(self.get_config_table(), title="[bold]Configuration", border_style="blue"))
+        self.layout["stats"].update(Panel(self.get_stats_table(), title="[bold]Performance", border_style="magenta"))
         self.layout["telemetry"].update(
-            Panel(self.get_telemetry_table(), title="[bold]Live Telemetry[/bold]", border_style="green"))
+            Panel(self.get_telemetry_table(), title="[bold]Live Telemetry", border_style="green"))
 
         log_content = "\n".join(self.log_messages)
-        self.layout["log"].update(Panel(log_content, title="[bold]Event Log[/bold]", border_style="dim green"))
+        self.layout["log"].update(Panel(log_content, title="[bold]Event Log", border_style="dim green"))
 
 
 class Memory:
@@ -434,11 +484,15 @@ class CrossyGameEnv:
         stack = np.array(self.frame_buffer, dtype=np.float32)
         tensor_in = torch.FloatTensor(stack).unsqueeze(0).to(VAE_DEVICE)
 
+        vae_start = time.perf_counter()
         with torch.no_grad():
             # Original VAE returns: recon_static, pred_next, mu_c, log_c, mu_t, log_t
             _, _, mu_c, _, mu_t, _ = self.vae(tensor_in)
             # Concatenate Context (128) and Trend (128) = 256
             latents = torch.cat([mu_c, mu_t], dim=1).cpu().numpy().flatten()
+
+        if self.ui:
+            self.ui.vae_latency = (time.perf_counter() - vae_start) * 1000
 
         # 3. Proprioception & Score (RAM Tracking)
         # Fetch coordinates automatically bypassing CV completely
@@ -672,21 +726,25 @@ def train():
 
                 # Safety Loop Break
                 for t in range(1000):
-                    step_start_time = time.time()
+                    step_start_time = time.perf_counter()
                     time_step += 1
 
                     # Select Action (Move state to CPU for PPO)
                     state_t = torch.FloatTensor(state).to(PPO_DEVICE)
                     mask_t = torch.FloatTensor(action_mask).to(PPO_DEVICE)
 
+                    ppo_start = time.perf_counter()
                     action, logprob, value = ppo.policy_old.act(state_t, mask_t)
+                    ui.ppo_latency = (time.perf_counter() - ppo_start) * 1000
 
                     # Record action in UI
                     action_map = {0: "Idle", 1: "Up", 2: "Left", 3: "Right"}
                     ui.last_action = action_map.get(action, "Unknown")
 
                     # Execute
+                    env_start = time.perf_counter()
                     next_state, reward, done, next_action_mask = env.step(action)
+                    ui.env_latency = (time.perf_counter() - env_start) * 1000
 
                     # Handle Step Failure
                     if next_state is None:
@@ -712,10 +770,15 @@ def train():
                     ui.current_reward = current_ep_reward
                     ui.total_steps += 1
 
-                    # Exponential Moving Average for smoother FPS calculation
-                    step_time = time.time() - step_start_time
+                    # High-Precision FPS Calculation
+                    step_time = time.perf_counter() - step_start_time
                     current_fps = 1.0 / step_time if step_time > 0 else 0.0
-                    ui.fps = current_fps if ui.fps == 0.0 else (0.8 * ui.fps) + (0.2 * current_fps)
+                    ui.fps = current_fps if ui.fps == 0.0 else (0.9 * ui.fps) + (0.1 * current_fps)
+
+                    # Update UI data every step to ensure real-time log scrolling
+                    ui.current_step = t
+                    ui.current_reward = current_ep_reward
+                    ui.total_steps += 1
                     ui.update()
 
                     # Update Policy

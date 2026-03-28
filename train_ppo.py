@@ -110,54 +110,6 @@ class TrainingUI:
             Layout(name="stats")
         )
         self.layout["body"].split(
-            Layout(name="telemetry", size=15),
-            Layout(name="log")
-        )
-
-        self.layout["header"].update(
-            Panel(Align.center("[bold]CROSSY ROAD PPO AGENT[/bold]"), style="bold cyan", border_style="cyan"))
-        self.layout["footer"].update(
-            Panel(Align.center("[dim]Training in progress... Press CTRL+C to abort & save plots[/dim]"),
-                  border_style="cyan"))
-        self.update()
-        self.episodes_completed = 0
-        self.total_steps = 0
-        self.policy_updates = 0
-        self.recent_scores = deque(maxlen=50)
-
-        # Plotting Data Tracking
-        self.all_scores = []
-        self.all_rewards = []
-
-        # Telemetry state
-        self.current_ep = 0
-        self.current_step = 0
-        self.current_score = 0
-        self.last_action = "Idle"
-        self.current_reward = 0.0
-        self.game_state = "UNKNOWN"
-        self.ram_x = 0
-        self.ram_z = 0
-        self.fps = 0.0
-        self.action_mask_status = ""
-
-        self._setup_layout()
-
-    def _setup_layout(self):
-        self.layout.split(
-            Layout(name="header", size=3),
-            Layout(name="main", ratio=1),
-            Layout(name="footer", size=3),
-        )
-        self.layout["main"].split_row(
-            Layout(name="side", size=40),
-            Layout(name="body", ratio=2)
-        )
-        self.layout["side"].split(
-            Layout(name="config", size=11),
-            Layout(name="stats")
-        )
-        self.layout["body"].split(
             Layout(name="telemetry", size=14),
             Layout(name="log")
         )
@@ -167,13 +119,30 @@ class TrainingUI:
         self.layout["footer"].update(
             Panel(Align.center("[dim]Training in progress... Press CTRL+C to abort & save plots[/dim]"),
                   border_style="cyan"))
-        self.update()
+
+        # Setup dynamic renderables so the Live thread pulls data seamlessly without tearing
+        class DynamicRender:
+            def __init__(self, render_func):
+                self.render_func = render_func
+
+            def __rich__(self):
+                return self.render_func()
+
+        self.layout["config"].update(
+            DynamicRender(lambda: Panel(self.get_config_table(), title="[bold]Configuration", border_style="blue")))
+        self.layout["stats"].update(
+            DynamicRender(lambda: Panel(self.get_stats_table(), title="[bold]Performance", border_style="magenta")))
+        self.layout["telemetry"].update(DynamicRender(
+            lambda: Panel(self.get_telemetry_table(), title="[bold]Live Telemetry", border_style="green")))
+        self.layout["log"].update(DynamicRender(
+            lambda: Panel("\n".join(self.log_messages), title="[bold]Event Log (Newest First)[/bold]",
+                          border_style="dim green")))
 
     def log(self, message):
         timestamp = datetime.now().strftime("%H:%M:%S")
-        self.log_messages.append(f"[[dim]{timestamp}[/dim]] {message}")
-        # Intentionally NOT calling self.update() here to prevent burst-log flickering.
-        # It will be naturally drawn on the next scheduled update.
+        # Append left so newest messages are at the top.
+        # This prevents new messages from being hidden if the Layout crops the bottom!
+        self.log_messages.appendleft(f"[[dim]{timestamp}[/dim]] {message}")
 
     def get_config_table(self):
         table = Table(box=None, show_header=False, expand=True)
@@ -223,22 +192,16 @@ class TrainingUI:
         table.add_row("PPO Latency:", f"{self.ppo_latency:.1f} ms")
         table.add_row("Env Latency:", f"{self.env_latency:.1f} ms")
         table.add_row("Total Cycle:", f"[{budget_color}]{budget_used:.1f} ms[/ {budget_color}]")
-        table.add_row("Z-Score:", f"[bold yellow]{self.current_score}[/bold yellow] (X: {self.ram_x:.1f})")
+        table.add_row("Z-Score:", f"[bold yellow]{self.ram_z:.1f}[/bold yellow] (X: {self.ram_x:.1f})")
         table.add_row("Last Action:", f"[bold cyan]{self.last_action}[/bold cyan]")
         table.add_row("Ep Reward:", f"{self.current_reward:.2f}")
 
         return table
 
     def update(self):
-        # We removed the throttle. To fix flickering, we ensure the Panel titles
-        # and borders are consistent. The 'Live' context in train() will handle refresh.
-        self.layout["config"].update(Panel(self.get_config_table(), title="[bold]Configuration", border_style="blue"))
-        self.layout["stats"].update(Panel(self.get_stats_table(), title="[bold]Performance", border_style="magenta"))
-        self.layout["telemetry"].update(
-            Panel(self.get_telemetry_table(), title="[bold]Live Telemetry", border_style="green"))
-
-        log_content = "\n".join(self.log_messages)
-        self.layout["log"].update(Panel(log_content, title="[bold]Event Log", border_style="dim green"))
+        # Deprecated manual update.
+        # Layout renderables are now dynamic and polled cleanly by the background Live thread.
+        pass
 
 
 class Memory:
@@ -699,8 +662,8 @@ def train():
 
     start_episode = 1
 
-    # Reduced refresh rate slightly to 5 fps to prevent Rich tearing
-    with Live(ui.layout, console=ui.console, screen=True, refresh_per_second=5) as live:
+    # Increased refresh rate to 30 fps for near-real-time updates
+    with Live(ui.layout, console=ui.console, screen=True, refresh_per_second=30) as live:
         try:
             # --- AUTO RESUME LOGIC ---
             checkpoints = glob.glob("checkpoints/ppo_crossy_*.pth")
@@ -764,11 +727,6 @@ def train():
                     state = next_state
                     action_mask = next_action_mask
                     current_ep_reward += reward
-
-                    # Telemetry Update
-                    ui.current_step = t
-                    ui.current_reward = current_ep_reward
-                    ui.total_steps += 1
 
                     # High-Precision FPS Calculation
                     step_time = time.perf_counter() - step_start_time

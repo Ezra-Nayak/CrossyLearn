@@ -318,17 +318,19 @@ class CrossyGameEnv:
         # 2. Focus and Click Retry
         try:
             win32gui.SetForegroundWindow(self.hwnd)
-        except:
-            pass
+            geo = self.get_geometry()
+            rx, ry = geo['left'] + RETRY_BUTTON_COORDS[0], geo['top'] + RETRY_BUTTON_COORDS[1]
 
-        geo = self.get_geometry()
-        rx, ry = geo['left'] + RETRY_BUTTON_COORDS[0], geo['top'] + RETRY_BUTTON_COORDS[1]
-
-        # Click Retry / Tap to Start
-        pydirectinput.moveTo(rx, ry)
-        pydirectinput.click()
-        time.sleep(0.5)
-        pydirectinput.press('space')
+            # Click Retry / Tap to Start
+            pydirectinput.moveTo(rx, ry)
+            pydirectinput.click()
+            time.sleep(0.5)
+            pydirectinput.press('space')
+        except Exception as e:
+            print(f"[RECOVERY] Window manipulation failed (Target died): {e}")
+            time.sleep(2)
+            # Window process might have crashed out, fall through back into recursive reset to restart the executable
+            return self.reset()
 
         # 3. Clear memory for new run
         self.frame_buffer.clear()

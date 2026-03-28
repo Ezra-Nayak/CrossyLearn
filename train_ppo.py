@@ -12,12 +12,21 @@ import mss
 import win32gui
 import pydirectinput
 from collections import deque
+from datetime import datetime
+import matplotlib.pyplot as plt
+
+from rich.console import Console
+from rich.live import Live
+from rich.layout import Layout
+from rich.panel import Panel
+from rich.align import Align
+from rich.table import Table
+
 from train_vision import SplitBrainVAE, setup_device
 from vision import VisionSystem
 from tracker import RamTracker
 
 import subprocess
-import os
 
 EXECUTABLE_PATH = r"C:\Program Files\WindowsApps\Yodo1Ltd.CrossyRoad_1.3.4.0_x86__s3s3f300emkze\Crossy Road.exe"
 RETRY_BUTTON_COORDS = (767, 862) # Standard Retry button
@@ -44,6 +53,139 @@ WINDOW_TITLE = "Crossy Road"
 # PPO (Logic)  -> CPU for Stability (Fixes DirectML Scatter/Backward Crash)
 VAE_DEVICE = setup_device()
 PPO_DEVICE = torch.device("cpu")
+
+
+class TrainingUI:
+    def __init__(self):
+        self.console = Console()
+        self.layout = Layout(name="root")
+        self.log_messages = deque(maxlen=20)
+        self.start_time = time.time()
+        self.last_update_time = 0
+
+        # Stats
+        self.best_score = 0
+        self.episodes_completed = 0
+        self.total_steps = 0
+        self.policy_updates = 0
+        self.recent_scores = deque(maxlen=50)
+
+        # Plotting Data Tracking
+        self.all_scores = []
+        self.all_rewards = []
+
+        # Telemetry state
+        self.current_ep = 0
+        self.current_step = 0
+        self.current_score = 0
+        self.last_action = "Idle"
+        self.current_reward = 0.0
+        self.game_state = "UNKNOWN"
+        self.ram_x = 0
+        self.ram_z = 0
+        self.fps = 0.0
+        self.action_mask_status = ""
+
+        self._setup_layout()
+
+    def _setup_layout(self):
+        self.layout.split(
+            Layout(name="header", size=3),
+            Layout(name="main", ratio=1),
+            Layout(name="footer", size=3),
+        )
+        self.layout["main"].split_row(
+            Layout(name="side", size=40),
+            Layout(name="body", ratio=2)
+        )
+        self.layout["side"].split(
+            Layout(name="config", size=11),
+            Layout(name="stats")
+        )
+        self.layout["body"].split(
+            Layout(name="telemetry", size=14),
+            Layout(name="log")
+        )
+
+        self.layout["header"].update(
+            Panel(Align.center("[bold]CROSSY ROAD PPO AGENT[/bold]"), style="bold cyan", border_style="cyan"))
+        self.layout["footer"].update(
+            Panel(Align.center("[dim]Training in progress... Press CTRL+C to abort & save plots[/dim]"),
+                  border_style="cyan"))
+        self.update(force=True)
+
+    def log(self, message):
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        self.log_messages.append(f"[[dim]{timestamp}[/dim]] {message}")
+        # Intentionally NOT calling self.update() here to prevent burst-log flickering.
+        # It will be naturally drawn on the next scheduled update.
+
+    def get_config_table(self):
+        table = Table(box=None, show_header=False, expand=True)
+        table.add_column(style="bold dim", width=18)
+        table.add_column(style="bright_white")
+        table.add_row("Device (VAE):", str(VAE_DEVICE))
+        table.add_row("Device (PPO):", str(PPO_DEVICE))
+        table.add_row("Learning Rate:", str(LR))
+        table.add_row("Gamma / GAE:", f"{GAMMA} / {GAE_LAMBDA}")
+        table.add_row("Latent Dim:", str(LATENT_DIM))
+        table.add_row("Hidden Dim:", str(HIDDEN_DIM))
+        table.add_row("Update Step:", str(UPDATE_TIMESTEP))
+        return table
+
+    def get_stats_table(self):
+        table = Table(box=None, show_header=False, expand=True)
+        table.add_column(style="bold dim", width=18)
+        table.add_column(style="bright_white")
+
+        avg_score = sum(self.recent_scores) / len(self.recent_scores) if self.recent_scores else 0.0
+        elapsed = time.time() - self.start_time
+        hours, rem = divmod(elapsed, 3600)
+        mins, secs = divmod(rem, 60)
+
+        table.add_row("Runtime:", f"{int(hours):02d}h {int(mins):02d}m {int(secs):02d}s")
+        table.add_row("Total Steps:", f"{self.total_steps:,}")
+        table.add_row("Episodes:", f"{self.episodes_completed:,}")
+        table.add_row("Policy Updates:", f"{self.policy_updates:,}")
+        table.add_row("Best Score:", f"[bold green]{self.best_score}[/bold green]")
+        table.add_row("Avg Score (50):", f"{avg_score:.1f}")
+        return table
+
+    def get_telemetry_table(self):
+        table = Table(box=None, show_header=False, expand=True)
+        table.add_column(style="bold dim", width=15)
+        table.add_column()
+
+        state_color = "green" if self.game_state == "PLAYING" else "red"
+
+        table.add_row("Game State:", f"[{state_color}]{self.game_state}[/{state_color}]")
+        table.add_row("Current Ep:", str(self.current_ep))
+        table.add_row("Ep Step:", str(self.current_step))
+        table.add_row("RAM Pos:", f"X: {self.ram_x} | Z: {self.ram_z}")
+        table.add_row("Z-Score:", f"[bold yellow]{self.current_score}[/bold yellow]")
+        table.add_row("Last Action:", f"[bold cyan]{self.last_action}[/bold cyan]")
+        table.add_row("Mask Status:", self.action_mask_status)
+        table.add_row("Ep Reward:", f"{self.current_reward:.2f}")
+        table.add_row("Loop FPS:", f"{self.fps:.1f} (Decisions/sec)")
+
+        return table
+
+    def update(self, force=False):
+        now = time.time()
+        # THROTTLE: Prevents the layout from being entirely reconstructed too fast (fixes flickering)
+        if not force and now - self.last_update_time < 0.2:
+            return
+        self.last_update_time = now
+
+        self.layout["config"].update(
+            Panel(self.get_config_table(), title="[bold]Configuration[/bold]", border_style="blue"))
+        self.layout["stats"].update(
+            Panel(self.get_stats_table(), title="[bold]Performance[/bold]", border_style="magenta"))
+        self.layout["telemetry"].update(
+            Panel(self.get_telemetry_table(), title="[bold]Live Telemetry[/bold]", border_style="green"))
+
+        log_content = "\n".join(self.log_messages)
+        self.layout["log"].update(Panel(log_content, title="[bold]Event Log[/bold]", border_style="dim green"))
 
 
 class Memory:
@@ -191,7 +333,8 @@ class PPO:
 
 
 class CrossyGameEnv:
-    def __init__(self):
+    def __init__(self, ui=None):
+        self.ui = ui
         self.vae = SplitBrainVAE().to(VAE_DEVICE)
         self.vae.load_state_dict(torch.load(VAE_CHECKPOINT, map_location=VAE_DEVICE, weights_only=False))
         self.vae.eval()
@@ -211,31 +354,37 @@ class CrossyGameEnv:
         self.sct = mss.mss()
         self._ensure_game_running()
 
+    def _log(self, msg):
+        if self.ui:
+            self.ui.log(msg)
+        else:
+            print(msg)
+
     def _ensure_game_running(self):
         self.hwnd = win32gui.FindWindow(None, WINDOW_TITLE)
         if not self.hwnd:
-            print("[RECOVERY] Game window not found. Launching Crossy Road...")
+            self._log("[RECOVERY] Game window not found. Launching Crossy Road...")
             try:
                 # Launching WindowsApps sometimes requires 'start' shell command
                 os.system(f'start "" "{EXECUTABLE_PATH}"')
 
                 # Wait for load (WindowsApps can be slow)
-                print("[RECOVERY] Waiting 9 seconds for startup...")
+                self._log("[RECOVERY] Waiting 9 seconds for startup...")
                 time.sleep(9)
 
                 self.hwnd = win32gui.FindWindow(None, WINDOW_TITLE)
                 if not self.hwnd:
-                    print("[ERROR] Failed to find window after launch.")
+                    self._log("[ERROR] Failed to find window after launch.")
                     return False
 
                 # Focus and pass splash screen
                 win32gui.SetForegroundWindow(self.hwnd)
                 time.sleep(2)
                 pydirectinput.press('space')
-                print("[RECOVERY] Splash screen passed.")
+                self._log("[RECOVERY] Splash screen passed.")
                 time.sleep(2)
             except Exception as e:
-                print(f"[RECOVERY] Failed to launch: {e}")
+                self._log(f"[RECOVERY] Failed to launch: {e}")
                 return False
         return True
 
@@ -306,12 +455,22 @@ class CrossyGameEnv:
         # Use Z axis directly as the continuous score (progress tracker)
         current_score = self.last_known_coords[1]
 
+        if self.ui:
+            self.ui.ram_x = self.last_known_coords[0]
+            self.ui.ram_z = current_score
+            self.ui.game_state = "PLAYING" if data['pause_visible'] else "DEAD/MENU"
+
+            mask_str = []
+            if action_mask[2] < -1: mask_str.append("L")
+            if action_mask[3] < -1: mask_str.append("R")
+            self.ui.action_mask_status = f"Restricted: {','.join(mask_str)}" if mask_str else "Free"
+
         return state_vec, current_score, data['pause_visible'], action_mask
 
     def reset(self):
         # 1. Crash Check
         if not self._ensure_game_running():
-            print("[CRITICAL] Could not recover game.")
+            self._log("[CRITICAL] Could not recover game.")
             time.sleep(5)
             return self.reset()  # Recursive retry
 
@@ -327,7 +486,7 @@ class CrossyGameEnv:
             time.sleep(0.5)
             pydirectinput.press('space')
         except Exception as e:
-            print(f"[RECOVERY] Window manipulation failed (Target died): {e}")
+            self._log(f"[RECOVERY] Window manipulation failed (Target died): {e}")
             time.sleep(2)
             # Window process might have crashed out, fall through back into recursive reset to restart the executable
             return self.reset()
@@ -392,7 +551,7 @@ class CrossyGameEnv:
             # --- MILESTONE BONUS ---
             if score >= self.next_milestone:
                 reward += 5.0
-                print(f"[BONUS] Milestone reached! Z-Score: {score}")
+                self._log(f"[BONUS] Milestone reached! Z-Score: {score}")
                 self.next_milestone += 10
             # -----------------------
 
@@ -421,88 +580,167 @@ class CrossyGameEnv:
 
 
 import glob
+import matplotlib.pyplot as plt
+
+
+def save_training_plots(ui_data):
+    """Generates and saves visual training plots on program shutdown."""
+    if not ui_data.all_scores:
+        print("\n[INFO] No episode data collected to plot.")
+        return
+
+    os.makedirs("logs", exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    plt.figure(figsize=(12, 8))
+
+    # Subplot 1: Scores with Moving Average
+    plt.subplot(2, 1, 1)
+    plt.plot(ui_data.all_scores, label="Max Z-Score", alpha=0.4, color='blue')
+    window = min(10, len(ui_data.all_scores))
+    if window > 0:
+        ma = np.convolve(ui_data.all_scores, np.ones(window) / window, mode='valid')
+        # Shift X to align properly with the moving average array size
+        plt.plot(range(window - 1, len(ui_data.all_scores)), ma, label=f"{window}-Ep Moving Avg", color='red',
+                 linewidth=2)
+    plt.title("Agent Progression over Episodes")
+    plt.ylabel("Z-Score (Distance)")
+    plt.legend()
+    plt.grid(True, linestyle='--', alpha=0.6)
+
+    # Subplot 2: Episode Rewards
+    plt.subplot(2, 1, 2)
+    plt.plot(ui_data.all_rewards, label="Total Ep Reward", color='green', alpha=0.7)
+    plt.title("Cumulative Reward per Episode")
+    plt.xlabel("Episode Index")
+    plt.ylabel("Reward")
+    plt.legend()
+    plt.grid(True, linestyle='--', alpha=0.6)
+
+    plt.tight_layout()
+    filepath = f"logs/training_metrics_{timestamp}.png"
+    plt.savefig(filepath)
+    plt.close()
+    print(f"\n[INFO] Successfully saved training plots to {filepath}")
 
 
 def train():
-    env = CrossyGameEnv()
+    ui = TrainingUI()
+    env = CrossyGameEnv(ui)
+
     # State Dim is now 257 (256 Latents + 1 Normalized X)
     ppo = PPO(257, 4)
     memory = Memory()
 
     start_episode = 1
 
-    # --- AUTO RESUME LOGIC ---
-    checkpoints = glob.glob("checkpoints/ppo_crossy_*.pth")
-    if checkpoints:
-        # Find the one with the highest number
-        latest_cp = max(checkpoints, key=lambda x: int(x.split('_')[-1].split('.')[0]))
-        print(f"[RESUME] Loading checkpoint: {latest_cp}")
+    # Reduced refresh rate slightly to 5 fps to prevent Rich tearing
+    with Live(ui.layout, console=ui.console, screen=True, refresh_per_second=5) as live:
+        try:
+            # --- AUTO RESUME LOGIC ---
+            checkpoints = glob.glob("checkpoints/ppo_crossy_*.pth")
+            if checkpoints:
+                latest_cp = max(checkpoints, key=lambda x: int(x.split('_')[-1].split('.')[0]))
+                ui.log(f"[RESUME] Loading checkpoint: {latest_cp}")
+                ppo.policy.load_state_dict(torch.load(latest_cp, map_location=PPO_DEVICE, weights_only=False))
+                ppo.policy_old.load_state_dict(ppo.policy.state_dict())
+                start_episode = int(latest_cp.split('_')[-1].split('.')[0]) + 1
+                ui.log(f"[RESUME] Resuming from Episode {start_episode}")
+            else:
+                ui.log("--- STARTING NEW TRAINING SESSION ---")
 
-        # Load weights
-        ppo.policy.load_state_dict(torch.load(latest_cp, map_location=PPO_DEVICE, weights_only=False))
-        ppo.policy_old.load_state_dict(ppo.policy.state_dict())
+            ui.log("Focus the game window! Starting in 3 seconds...")
+            time.sleep(3)
 
-        # Parse episode number
-        start_episode = int(latest_cp.split('_')[-1].split('.')[0]) + 1
-        print(f"[RESUME] Resuming from Episode {start_episode}")
-    else:
-        print("--- STARTING NEW TRAINING SESSION ---")
-    print("Focus the game window!")
-    time.sleep(3)
+            time_step = 0
 
-    time_step = 0
+            for i_episode in range(start_episode, MAX_EPISODES + 1):
+                ui.current_ep = i_episode
+                state, action_mask = env.reset()
+                current_ep_reward = 0
 
-    for i_episode in range(start_episode, MAX_EPISODES + 1):
-        state, action_mask = env.reset()
-        current_ep_reward = 0
+                # Safety Loop Break
+                for t in range(1000):
+                    step_start_time = time.time()
+                    time_step += 1
 
-        # Safety Loop Break
-        for t in range(1000):
-            time_step += 1
+                    # Select Action (Move state to CPU for PPO)
+                    state_t = torch.FloatTensor(state).to(PPO_DEVICE)
+                    mask_t = torch.FloatTensor(action_mask).to(PPO_DEVICE)
 
-            # Select Action (Move state to CPU for PPO)
-            state_t = torch.FloatTensor(state).to(PPO_DEVICE)
-            mask_t = torch.FloatTensor(action_mask).to(PPO_DEVICE)
+                    action, logprob, value = ppo.policy_old.act(state_t, mask_t)
 
-            action, logprob, value = ppo.policy_old.act(state_t, mask_t)
+                    # Record action in UI
+                    action_map = {0: "Idle", 1: "Up", 2: "Left", 3: "Right"}
+                    ui.last_action = action_map.get(action, "Unknown")
 
-            # Execute
-            next_state, reward, done, next_action_mask = env.step(action)
+                    # Execute
+                    next_state, reward, done, next_action_mask = env.step(action)
 
-            # Handle Step Failure
-            if next_state is None:
-                print("[PPO] Step failed. Resetting...")
-                done = True
-                reward = -10.0
+                    # Handle Step Failure
+                    if next_state is None:
+                        ui.log("[PPO] Step failed. Resetting...")
+                        done = True
+                        reward = -10.0
 
-            # Store (CPU)
-            memory.states.append(state_t)
-            memory.actions.append(torch.tensor(action).to(PPO_DEVICE))
-            memory.logprobs.append(torch.tensor(logprob).to(PPO_DEVICE))
-            memory.rewards.append(reward)
-            memory.is_terminals.append(done)
-            memory.values.append(value)
-            memory.action_masks.append(mask_t)
+                    # Store (CPU)
+                    memory.states.append(state_t)
+                    memory.actions.append(torch.tensor(action).to(PPO_DEVICE))
+                    memory.logprobs.append(torch.tensor(logprob).to(PPO_DEVICE))
+                    memory.rewards.append(reward)
+                    memory.is_terminals.append(done)
+                    memory.values.append(value)
+                    memory.action_masks.append(mask_t)
 
-            state = next_state
-            action_mask = next_action_mask
-            current_ep_reward += reward
+                    state = next_state
+                    action_mask = next_action_mask
+                    current_ep_reward += reward
 
-            # Update Policy
-            if time_step % UPDATE_TIMESTEP == 0:
-                print(f"[PPO] Updating Policy at Step {time_step}...")
-                ppo.update(memory)
-                memory.clear()
-                time_step = 0
+                    # Telemetry Update
+                    ui.current_step = t
+                    ui.current_reward = current_ep_reward
+                    ui.total_steps += 1
 
-            if done:
-                break
+                    # Exponential Moving Average for smoother FPS calculation
+                    step_time = time.time() - step_start_time
+                    current_fps = 1.0 / step_time if step_time > 0 else 0.0
+                    ui.fps = current_fps if ui.fps == 0.0 else (0.8 * ui.fps) + (0.2 * current_fps)
+                    ui.update()
 
-        print(f"Ep {i_episode} | Reward: {current_ep_reward:.2f} | Score: {env.last_score}")
+                    # Update Policy
+                    if time_step % UPDATE_TIMESTEP == 0:
+                        ui.log(f"[PPO] Updating Policy at Step {time_step}...")
+                        ppo.update(memory)
+                        memory.clear()
+                        time_step = 0
+                        ui.policy_updates += 1
+                        ui.log("[PPO] Policy Update Complete.")
 
-        # Save Checkpoint
-        if i_episode % 50 == 0:
-            torch.save(ppo.policy.state_dict(), f"checkpoints/ppo_crossy_{i_episode}.pth")
+                    if done:
+                        break
+
+                ui.episodes_completed += 1
+                ui.recent_scores.append(env.last_score)
+                ui.all_scores.append(env.last_score)
+                ui.all_rewards.append(current_ep_reward)
+
+                if env.last_score > ui.best_score:
+                    ui.best_score = env.last_score
+                    ui.log(f"[NEW BEST] Reached Z-Score {env.last_score}!")
+
+                ui.log(f"Ep {i_episode} ended | Reward: {current_ep_reward:.2f} | Score: {env.last_score}")
+
+                # Save Checkpoint
+                if i_episode % 50 == 0:
+                    torch.save(ppo.policy.state_dict(), f"checkpoints/ppo_crossy_{i_episode}.pth")
+                    ui.log(f"[SAVE] Checkpoint saved for Ep {i_episode}")
+
+        except KeyboardInterrupt:
+            ui.log("[SHUTDOWN] Keyboard interrupt detected. Preparing to exit...")
+            time.sleep(1)  # Give UI a moment to show the shutdown message before destroying Live context
+
+    # Executed after the Live context has exited (Terminal returns to normal)
+    save_training_plots(ui)
 
 
 if __name__ == "__main__":

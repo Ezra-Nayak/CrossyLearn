@@ -11,7 +11,7 @@ from vision import VisionSystem
 
 # --- CONFIG ---
 WINDOW_TITLE = "Crossy Road"
-VAE_CHECKPOINT = "checkpoints/crossy_vae_latest.pth"
+VAE_CHECKPOINT = "checkpoints/crossy_vae_best.pth"
 DISPLAY_SCALE = 5  # Scales up the 160x160 images for easier viewing
 
 
@@ -91,9 +91,6 @@ def main():
             # Build Tensor
             stack = np.array(frame_buffer, dtype=np.float32)
             tensor_in = torch.FloatTensor(stack).unsqueeze(0).to(device)
-
-            # Force the verifier to run at ~12 FPS to match the PPO agent's frame stacking
-            time.sleep(0.08)
 
             # --- FORWARD PASS ---
             with torch.no_grad():

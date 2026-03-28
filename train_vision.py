@@ -19,8 +19,8 @@ class DMLAdam(Optimizer):
     Replaces the 'lerp' operator (unsupported on DML GPU) with basic add/mul.
     """
 
-    def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8):
-        defaults = dict(lr=lr, betas=betas, eps=eps)
+    def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.0):
+        defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
         super(DMLAdam, self).__init__(params, defaults)
 
     @torch.no_grad()
@@ -34,6 +34,11 @@ class DMLAdam(Optimizer):
             for p in group['params']:
                 if p.grad is None: continue
                 grad = p.grad
+
+                # Prevent Overfitting: L2 Regularization
+                if group['weight_decay'] != 0:
+                    grad = grad.add(p, alpha=group['weight_decay'])
+
                 state = self.state[p]
 
                 # State initialization
@@ -175,14 +180,21 @@ class SplitBrainVAE(nn.Module):
         h = self.encoder(x)
         h = h.view(h.size(0), -1)
 
+        # Add Dropout to prevent overfitting (no parameters, safe for loaded checkpoints)
+        h = F.dropout(h, p=0.3, training=self.training)
+
         mu_c, log_c = self.fc_mu_c(h), self.fc_log_c(h)
         mu_t, log_t = self.fc_mu_t(h), self.fc_log_t(h)
 
         z_c = self.reparameterize(mu_c, log_c)
         z_t = self.reparameterize(mu_t, log_t)
 
-        recon_static = self.decode(z_c)
-        pred_next = self.decode(z_t)
+        # Regularize the latent variables structurally
+        z_c_dropped = F.dropout(z_c, p=0.2, training=self.training)
+        z_t_dropped = F.dropout(z_t, p=0.2, training=self.training)
+
+        recon_static = self.decode(z_c_dropped)
+        pred_next = self.decode(z_t_dropped)
 
         return recon_static, pred_next, mu_c, log_c, mu_t, log_t
 
@@ -237,26 +249,59 @@ def train():
     if not os.path.exists(CHECKPOINT_DIR): os.makedirs(CHECKPOINT_DIR)
 
     dataset = CrossyVisionDataset("data")
-    if len(dataset) < 500:
-        print(f"[WARNING] Only {len(dataset)} samples found. VAE requires 2000+ for good results.")
+    dataset_size = len(dataset)
+    if dataset_size < 500:
+        print(f"[WARNING] Only {dataset_size} samples found. VAE requires 2000+ for good results.")
 
-    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
+    # Prevent Overfitting: Train/Validation Split
+    val_size = max(1, int(dataset_size * 0.1))  # 10% for validation
+    train_size = dataset_size - val_size
+    train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
+
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
+    val_batch = min(BATCH_SIZE, val_size)
+    val_loader = DataLoader(val_dataset, batch_size=val_batch, shuffle=False, drop_last=False)
+
     model = SplitBrainVAE().to(DEVICE)
 
-    # SOTA: Use custom DMLAdam to bypass the unsupported 'lerp' kernel on DirectML GPUs.
-    optimizer = DMLAdam(model.parameters(), lr=LR)
+    # Resume Training Logic
+    start_epoch = 1
+    latest_ckpt = f"{CHECKPOINT_DIR}/crossy_vae_latest.pth"
+    if os.path.exists(latest_ckpt):
+        try:
+            model.load_state_dict(torch.load(latest_ckpt, map_location=DEVICE))
+            print(f"[TRAIN] Resumed weights from {latest_ckpt}.")
+        except Exception as e:
+            print(f"[ERROR] Could not load checkpoint: {e}")
 
-    print(f"[TRAIN] Starting on {DEVICE} with {len(dataset)} samples.")
+    # SOTA: Use custom DMLAdam with weight_decay for L2 Regularization (Overfitting Prevention)
+    optimizer = DMLAdam(model.parameters(), lr=LR, weight_decay=1e-4)
 
-    for epoch in range(1, EPOCHS + 1):
+    print(f"[TRAIN] Starting on {DEVICE} with {train_size} train and {val_size} val samples.")
+    best_val_loss = float('inf')
+
+    for epoch in range(start_epoch, EPOCHS + 1):
         model.train()
         total_loss = 0
 
-        for batch_idx, (inputs, targets) in enumerate(dataloader):
+        for batch_idx, (inputs, targets) in enumerate(train_loader):
             inputs, targets = inputs.to(DEVICE), targets.to(DEVICE)
+
+            # Prevent Overfitting: Random Horizontal Flip (Doubles effective dataset size)
+            if torch.rand(1).item() > 0.5:
+                inputs = torch.flip(inputs, dims=[3])
+                targets = torch.flip(targets, dims=[3])
+
             current_frame = inputs[:, 3:4, :, :]
 
-            recon, pred, mu_c, log_c, mu_t, log_t = model(inputs)
+            # Prevent Overfitting: Stronger Denoising & Spatial Dropout
+            noise = torch.randn_like(inputs) * 0.1
+            noisy_inputs = torch.clamp(inputs + noise, 0.0, 1.0)
+
+            mask = (torch.rand_like(inputs[:, 0:1, :, :]) > 0.05).float()
+            noisy_inputs = noisy_inputs * mask
+
+            recon, pred, mu_c, log_c, mu_t, log_t = model(noisy_inputs)
 
             loss_context = F.mse_loss(recon, current_frame)
             loss_trend = F.mse_loss(pred, targets)
@@ -266,8 +311,8 @@ def train():
             kld /= (BATCH_SIZE * 2)
 
             # EXPERIMENTAL: Increased KLD to structure the latent space better.
-            # If images turn gray/checkerboard, lower this back to 0.00001
-            KLD_WEIGHT = 0.00001
+            # Increased slightly to penalize complex latent structures that overfit.
+            KLD_WEIGHT = 0.00005
             loss = loss_context + (2.0 * loss_trend) + (KLD_WEIGHT * kld)
 
             optimizer.zero_grad()
@@ -275,15 +320,44 @@ def train():
             optimizer.step()
 
             total_loss += loss.item()
-        if epoch % 50 == 0 or epoch == 1:
-            print(f"Epoch {epoch} | Loss: {total_loss / len(dataloader):.4f}")
+
+        train_loss = total_loss / len(train_loader)
+
+        # Validation Loop
+        model.eval()
+        val_loss = 0
+        with torch.no_grad():
+            for val_inputs, val_targets in val_loader:
+                val_inputs, val_targets = val_inputs.to(DEVICE), val_targets.to(DEVICE)
+                val_current = val_inputs[:, 3:4, :, :]
+
+                v_recon, v_pred, v_mu_c, v_log_c, v_mu_t, v_log_t = model(val_inputs)
+
+                v_loss_context = F.mse_loss(v_recon, val_current)
+                v_loss_trend = F.mse_loss(v_pred, val_targets)
+
+                v_kld = -0.5 * torch.sum(1 + v_log_c - v_mu_c.pow(2) - v_log_c.exp())
+                v_kld += -0.5 * torch.sum(1 + v_log_t - v_mu_t.pow(2) - v_log_t.exp())
+                v_kld /= (val_inputs.size(0) * 2)
+
+                v_loss = v_loss_context + (2.0 * v_loss_trend) + (KLD_WEIGHT * v_kld)
+                val_loss += v_loss.item()
+
+        val_loss /= len(val_loader)
 
         if epoch % 50 == 0 or epoch == 1:
-            verify_vae(model, dataloader, epoch)
+            print(f"Epoch {epoch} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
+            verify_vae(model, val_loader, epoch)
+
+        # Save Best Validation Model (Early Stopping / Prevent Overfitting)
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            torch.save(model.state_dict(), f"{CHECKPOINT_DIR}/crossy_vae_best.pth")
 
         if epoch % 100 == 0:
             torch.save(model.state_dict(), f"{CHECKPOINT_DIR}/crossy_vae_ep{epoch}.pth")
             print(f"[SAVE] Permanent checkpoint saved at epoch {epoch}")
+
         torch.save(model.state_dict(), f"{CHECKPOINT_DIR}/crossy_vae_latest.pth")
 
 

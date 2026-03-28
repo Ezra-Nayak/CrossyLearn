@@ -301,6 +301,9 @@ class VisionSystem(threading.Thread):
                         cv2.waitKey(1)
 
                     try:
+                        # Standardize to 10 FPS:
+                        # This ensures the Vision thread produces exactly 10 states per second.
+                        time.sleep(0.1)
                         self.output_queue.put_nowait(result)
                     except queue.Full:
                         pass

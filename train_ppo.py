@@ -11,6 +11,9 @@ import queue
 import mss
 import win32gui
 import pydirectinput
+# Remove the default 0.1s delay between inputs to unlock loop speed
+pydirectinput.PAUSE = 0
+
 from collections import deque
 from datetime import datetime
 import matplotlib.pyplot as plt
@@ -402,9 +405,17 @@ class CrossyGameEnv:
         return {"top": pt[1] + 50, "left": pt[0], "width": right - left, "height": bottom - top - 50}
 
     def get_state(self):
-        # 1. Get Visual Data
+        # 1. Get Visual Data (FLUSH QUEUE FOR LATEST FRAME)
+        # Standardizing to 10 FPS requires grabbing the freshest capture.
+        data = None
         try:
-            data = self.vision_q.get(timeout=1.0)
+            # Drain the queue to ensure we aren't looking at a 100ms-old "buffered" frame
+            while not self.vision_q.empty():
+                data = self.vision_q.get_nowait()
+
+            # If the queue was already drained, wait for the next 10 FPS heartbeat
+            if data is None:
+                data = self.vision_q.get(timeout=1.0)
         except queue.Empty:
             return None, 0, True, {}  # Fail state
 
@@ -533,9 +544,9 @@ class CrossyGameEnv:
 
         self.steps_in_episode += 1  # Increment step counter
 
-        # Latency Wait
-        time.sleep(0.08)  # 80ms reaction time
-
+        # SYNCED EXECUTION:
+        # We removed the manual sleep. The loop now blocks on 'get_state()',
+        # which effectively waits for the Vision thread's 10 FPS (100ms) heartbeat.
         next_state, score, is_alive, action_mask = self.get_state()
 
         # --- REWARD ENGINEERING ---

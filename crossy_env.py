@@ -73,12 +73,9 @@ class CrossyEnv:
                 if not self.hwnd:
                     raise Exception("Failed to launch game or find window after launch.")
 
-                # Get it to the main menu
-                print("[ENV] Pressing Space to pass splash screen...")
-                time.sleep(2)
                 self._focus_window()
-                pydirectinput.press('space')
-                time.sleep(2)
+                time.sleep(1)
+                print("[ENV] Game launched and focused.")
 
             except Exception as e:
                 print(f"[ENV] Critical Error launching game: {e}")

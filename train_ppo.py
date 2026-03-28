@@ -394,12 +394,9 @@ class CrossyGameEnv:
                     self._log("[ERROR] Failed to find window after launch.")
                     return False
 
-                # Focus and pass splash screen
                 win32gui.SetForegroundWindow(self.hwnd)
-                time.sleep(2)
-                pydirectinput.press('space')
-                self._log("[RECOVERY] Splash screen passed.")
-                time.sleep(2)
+                time.sleep(1)
+                self._log("[RECOVERY] Game launched and focused.")
             except Exception as e:
                 self._log(f"[RECOVERY] Failed to launch: {e}")
                 return False
@@ -544,15 +541,7 @@ class CrossyGameEnv:
         return self.reset()
 
     def step(self, action):
-        # --- ACTION SHIELDING ---
-        # If this is the very first move of the run, we are still in the menu.
-        # Force 'Up' (1) to start the game and prevent entering Costume/Character menus.
-        if self.steps_in_episode == 0:
-            if action != 1:
-                # Override whatever the agent suggested (usually Left or Idle)
-                action = 1
-
-                # Action: 0:Idle, 1:Up, 2:Left, 3:Right
+        # Action: 0:Idle, 1:Up, 2:Left, 3:Right
         if action == 1:
             pydirectinput.press('up')
         elif action == 2:

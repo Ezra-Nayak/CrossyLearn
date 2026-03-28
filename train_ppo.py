@@ -93,6 +93,10 @@ class TrainingUI:
         self.fps = 0.0
         self.action_mask_status = ""
 
+        # Refresh gating to prevent full-screen redraw thrash on Windows terminals
+        self._last_ui_refresh = 0.0
+        self._ui_refresh_interval = 0.08  # ~12.5 FPS cap for the Rich screen
+
         self._setup_layout()
 
     def _setup_layout(self):
@@ -120,23 +124,7 @@ class TrainingUI:
             Panel(Align.center("[dim]Training in progress... Press CTRL+C to abort & save plots[/dim]"),
                   border_style="cyan"))
 
-        # Setup dynamic renderables so the Live thread pulls data seamlessly without tearing
-        class DynamicRender:
-            def __init__(self, render_func):
-                self.render_func = render_func
-
-            def __rich__(self):
-                return self.render_func()
-
-        self.layout["config"].update(
-            DynamicRender(lambda: Panel(self.get_config_table(), title="[bold]Configuration", border_style="blue")))
-        self.layout["stats"].update(
-            DynamicRender(lambda: Panel(self.get_stats_table(), title="[bold]Performance", border_style="magenta")))
-        self.layout["telemetry"].update(DynamicRender(
-            lambda: Panel(self.get_telemetry_table(), title="[bold]Live Telemetry", border_style="green")))
-        self.layout["log"].update(DynamicRender(
-            lambda: Panel("\n".join(self.log_messages), title="[bold]Event Log (Newest First)[/bold]",
-                          border_style="dim green")))
+        self.update()
 
     def log(self, message):
         timestamp = datetime.now().strftime("%H:%M:%S")
@@ -199,9 +187,22 @@ class TrainingUI:
         return table
 
     def update(self):
-        # Deprecated manual update.
-        # Layout renderables are now dynamic and polled cleanly by the background Live thread.
-        pass
+        # Reinstated manual update, exactly mimicking Hydra's UI loop pattern
+        self.layout["config"].update(
+            Panel(self.get_config_table(), title="[bold]Configuration[/bold]", border_style="blue"))
+        self.layout["stats"].update(
+            Panel(self.get_stats_table(), title="[bold]Performance[/bold]", border_style="magenta"))
+        self.layout["telemetry"].update(
+            Panel(self.get_telemetry_table(), title="[bold]Live Telemetry[/bold]", border_style="green"))
+        self.layout["log"].update(Panel("\n".join(self.log_messages), title="[bold]Event Log (Newest First)[/bold]",
+                                        border_style="dim green"))
+
+    def refresh(self, live, force=False):
+        now = time.perf_counter()
+        if force or (now - self._last_ui_refresh) >= self._ui_refresh_interval:
+            self.update()
+            live.refresh()
+            self._last_ui_refresh = now
 
 
 class Memory:
@@ -662,9 +663,8 @@ def train():
 
     start_episode = 1
 
-    # Set auto_refresh to False to prevent the background thread from fighting our loop.
-    # We will call live.refresh() manually for maximum stability (Hydra-style).
-    with Live(ui.layout, console=ui.console, screen=True, auto_refresh=False) as live:
+    # Set auto_refresh=False and vertical_overflow="visible" exactly like Hydra for rock-solid stability
+    with Live(ui.layout, console=ui.console, screen=True, auto_refresh=False, vertical_overflow="visible") as live:
         try:
             # --- AUTO RESUME LOGIC ---
             checkpoints = glob.glob("checkpoints/ppo_crossy_*.pth")
@@ -679,6 +679,7 @@ def train():
                 ui.log("--- STARTING NEW TRAINING SESSION ---")
 
             ui.log("Focus the game window! Starting in 3 seconds...")
+            ui.refresh(live, force=True)
             time.sleep(3)
 
             time_step = 0
@@ -739,20 +740,19 @@ def train():
                     ui.current_reward = current_ep_reward
                     ui.total_steps += 1
 
-                    # Manually trigger a UI frame update only when data is ready.
-                    # This eliminates flickering.
-                    live.refresh()
+                    # One bounded redraw per step keeps Rich stable on Windows
+                    ui.refresh(live)
 
                     # Update Policy
                     if time_step % UPDATE_TIMESTEP == 0:
                         ui.log(f"[PPO] Updating Policy at Step {time_step}...")
-                        live.refresh()  # Update UI to show the "Updating Policy" log immediately
+                        ui.refresh(live, force=True)  # Show the log once before the update starts
                         ppo.update(memory)
                         memory.clear()
                         time_step = 0
                         ui.policy_updates += 1
                         ui.log("[PPO] Policy Update Complete.")
-                        live.refresh()
+                        ui.refresh(live, force=True)
 
                     if done:
                         break
@@ -773,7 +773,7 @@ def train():
                     torch.save(ppo.policy.state_dict(), f"checkpoints/ppo_crossy_{i_episode}.pth")
                     ui.log(f"[SAVE] Checkpoint saved for Ep {i_episode}")
 
-                live.refresh()
+                ui.refresh(live, force=True)
 
         except KeyboardInterrupt:
             ui.log("[SHUTDOWN] Keyboard interrupt detected. Preparing to exit...")

@@ -193,7 +193,7 @@ class PPO:
 class CrossyGameEnv:
     def __init__(self):
         self.vae = SplitBrainVAE().to(VAE_DEVICE)
-        self.vae.load_state_dict(torch.load(VAE_CHECKPOINT, map_location=VAE_DEVICE))
+        self.vae.load_state_dict(torch.load(VAE_CHECKPOINT, map_location=VAE_DEVICE, weights_only=False))
         self.vae.eval()
 
         self.vision_q = queue.Queue(maxsize=1)
@@ -439,7 +439,7 @@ def train():
         print(f"[RESUME] Loading checkpoint: {latest_cp}")
 
         # Load weights
-        ppo.policy.load_state_dict(torch.load(latest_cp, map_location=PPO_DEVICE))
+        ppo.policy.load_state_dict(torch.load(latest_cp, map_location=PPO_DEVICE, weights_only=False))
         ppo.policy_old.load_state_dict(ppo.policy.state_dict())
 
         # Parse episode number

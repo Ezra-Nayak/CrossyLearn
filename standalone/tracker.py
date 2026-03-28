@@ -85,63 +85,65 @@ class RamTracker:
         except Exception:
             return False
 
-        # Check if already injected (Crash recovery check)
-        vault_addr = pymem.pattern.pattern_scan_all(self.pm.process_handle, self.vault_signature)
-        if vault_addr:
-            self.pointer_location = vault_addr + 8
-            return True
-
-        module = pymem.process.module_from_name(self.pm.process_handle, "UnityPlayer.dll")
-        if not module: return False
-
-        module_data = self.pm.read_bytes(module.lpBaseOfDll, module.SizeOfImage)
-        sig_offset = module_data.find(self.signature)
-        if sig_offset == -1: return False
-
-        inject_addr = module.lpBaseOfDll + sig_offset
-
         try:
+            # Check if already injected (Crash recovery check)
+            vault_addr = pymem.pattern.pattern_scan_all(self.pm.process_handle, self.vault_signature)
+            if vault_addr:
+                self.pointer_location = vault_addr + 8
+                return True
+
+            module = pymem.process.module_from_name(self.pm.process_handle, "UnityPlayer.dll")
+            if not module: return False
+
+            module_data = self.pm.read_bytes(module.lpBaseOfDll, module.SizeOfImage)
+            sig_offset = module_data.find(self.signature)
+            if sig_offset == -1: return False
+
+            inject_addr = module.lpBaseOfDll + sig_offset
+
             alloc_addr = self.pm.allocate(1024)
-        except Exception:
+
+            vault_addr = alloc_addr
+            code_addr = alloc_addr + 12
+
+            # 1. Build Payload (Vault + Original Instructions)
+            payload = bytearray()
+            payload.extend(self.vault_signature)
+            payload.extend(b'\x00\x00\x00\x00')  # pointer storage
+
+            payload.append(0xA3)  # mov[vault_addr + 8], eax
+            payload.extend(struct.pack("<I", vault_addr + 8))
+            payload.extend(b"\xF3\x0F\x5C\x18\xF3\x0F\x5C\x60\x04")  # Original bytes
+
+            # Jump back
+            return_addr = inject_addr + 9
+            jmp_offset = return_addr - (code_addr + 19)  # 19 bytes of code prior to jmp
+            payload.append(0xE9)
+            payload.extend(struct.pack("<i", jmp_offset))
+
+            self.pm.write_bytes(alloc_addr, bytes(payload), len(payload))
+
+            # 2. Build Hook (Replaces Original Code)
+            hook = bytearray()
+            hook.append(0xE9)
+            hook_offset = code_addr - (inject_addr + 5)
+            hook.extend(struct.pack("<i", hook_offset))
+            hook.extend(b"\x90\x90\x90\x90")  # NOP remaining 4 bytes
+
+            # 3. Patch the Game (Bypassing PAGE_EXECUTE_READ restrictions)
+            kernel32 = ctypes.windll.kernel32
+            old_protect = ctypes.c_ulong()
+            kernel32.VirtualProtectEx(self.pm.process_handle, inject_addr, 9, 0x40, ctypes.byref(old_protect))
+            self.pm.write_bytes(inject_addr, bytes(hook), len(hook))
+            kernel32.VirtualProtectEx(self.pm.process_handle, inject_addr, 9, old_protect, ctypes.byref(old_protect))
+
+            self.pointer_location = vault_addr + 8
+            print(f"[RAM] Automagically hooked! Vault located at: {hex(vault_addr)}")
+            return True
+        except Exception as e:
+            self.pm = None
+            self.pointer_location = None
             return False
-
-        vault_addr = alloc_addr
-        code_addr = alloc_addr + 12
-
-        # 1. Build Payload (Vault + Original Instructions)
-        payload = bytearray()
-        payload.extend(self.vault_signature)
-        payload.extend(b'\x00\x00\x00\x00')  # pointer storage
-
-        payload.append(0xA3)  # mov[vault_addr + 8], eax
-        payload.extend(struct.pack("<I", vault_addr + 8))
-        payload.extend(b"\xF3\x0F\x5C\x18\xF3\x0F\x5C\x60\x04")  # Original bytes
-
-        # Jump back
-        return_addr = inject_addr + 9
-        jmp_offset = return_addr - (code_addr + 19)  # 19 bytes of code prior to jmp
-        payload.append(0xE9)
-        payload.extend(struct.pack("<i", jmp_offset))
-
-        self.pm.write_bytes(alloc_addr, bytes(payload), len(payload))
-
-        # 2. Build Hook (Replaces Original Code)
-        hook = bytearray()
-        hook.append(0xE9)
-        hook_offset = code_addr - (inject_addr + 5)
-        hook.extend(struct.pack("<i", hook_offset))
-        hook.extend(b"\x90\x90\x90\x90")  # NOP remaining 4 bytes
-
-        # 3. Patch the Game (Bypassing PAGE_EXECUTE_READ restrictions)
-        kernel32 = ctypes.windll.kernel32
-        old_protect = ctypes.c_ulong()
-        kernel32.VirtualProtectEx(self.pm.process_handle, inject_addr, 9, 0x40, ctypes.byref(old_protect))
-        self.pm.write_bytes(inject_addr, bytes(hook), len(hook))
-        kernel32.VirtualProtectEx(self.pm.process_handle, inject_addr, 9, old_protect, ctypes.byref(old_protect))
-
-        self.pointer_location = vault_addr + 8
-        print(f"[RAM] Automagically hooked! Vault located at: {hex(vault_addr)}")
-        return True
 
     def get_coords(self):
         if not self.pm or not self.pointer_location:

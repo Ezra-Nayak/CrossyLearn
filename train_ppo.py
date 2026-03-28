@@ -662,8 +662,9 @@ def train():
 
     start_episode = 1
 
-    # Increased refresh rate to 30 fps for near-real-time updates
-    with Live(ui.layout, console=ui.console, screen=True, refresh_per_second=30) as live:
+    # Set auto_refresh to False to prevent the background thread from fighting our loop.
+    # We will call live.refresh() manually for maximum stability (Hydra-style).
+    with Live(ui.layout, console=ui.console, screen=True, auto_refresh=False) as live:
         try:
             # --- AUTO RESUME LOGIC ---
             checkpoints = glob.glob("checkpoints/ppo_crossy_*.pth")
@@ -733,20 +734,25 @@ def train():
                     current_fps = 1.0 / step_time if step_time > 0 else 0.0
                     ui.fps = current_fps if ui.fps == 0.0 else (0.9 * ui.fps) + (0.1 * current_fps)
 
-                    # Update UI data every step to ensure real-time log scrolling
+                    # Update UI data
                     ui.current_step = t
                     ui.current_reward = current_ep_reward
                     ui.total_steps += 1
-                    ui.update()
+
+                    # Manually trigger a UI frame update only when data is ready.
+                    # This eliminates flickering.
+                    live.refresh()
 
                     # Update Policy
                     if time_step % UPDATE_TIMESTEP == 0:
                         ui.log(f"[PPO] Updating Policy at Step {time_step}...")
+                        live.refresh()  # Update UI to show the "Updating Policy" log immediately
                         ppo.update(memory)
                         memory.clear()
                         time_step = 0
                         ui.policy_updates += 1
                         ui.log("[PPO] Policy Update Complete.")
+                        live.refresh()
 
                     if done:
                         break
@@ -766,6 +772,8 @@ def train():
                 if i_episode % 50 == 0:
                     torch.save(ppo.policy.state_dict(), f"checkpoints/ppo_crossy_{i_episode}.pth")
                     ui.log(f"[SAVE] Checkpoint saved for Ep {i_episode}")
+
+                live.refresh()
 
         except KeyboardInterrupt:
             ui.log("[SHUTDOWN] Keyboard interrupt detected. Preparing to exit...")

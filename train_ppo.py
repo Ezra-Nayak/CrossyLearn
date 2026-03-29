@@ -48,7 +48,7 @@ STACK_SIZE = 4
 IMG_SIZE = 160
 
 # --- CONFIG ---
-VAE_CHECKPOINT = "checkpoints/crossy_vae_latest.pth"
+VAE_CHECKPOINT = "checkpoints/crossy_vae_ep500.pth"  # Hardcoded to your best VQ-VAE model
 WINDOW_TITLE = "Crossy Road"
 
 # HYBRID COMPUTE SETUP
@@ -447,10 +447,12 @@ class CrossyGameEnv:
 
         vae_start = time.perf_counter()
         with torch.no_grad():
-            # Original VAE returns: recon_static, pred_next, mu_c, log_c, mu_t, log_t
-            _, _, mu_c, _, mu_t, _ = self.vae(tensor_in)
-            # Concatenate Context (128) and Trend (128) = 256
-            latents = torch.cat([mu_c, mu_t], dim=1).cpu().numpy().flatten()
+            # Spatial VQ-VAE returns 8 variables. We want the quantized spatial grids.
+            _, _, _, _, _, _, quant_c, quant_t = self.vae(tensor_in)
+
+            # quant_c is [1, 64, 10, 10]. quant_t is [1, 64, 10, 10].
+            # Concatenate along channel dim -> [1, 128, 10, 10], then flatten to 12,800
+            latents = torch.cat([quant_c, quant_t], dim=1).cpu().numpy().flatten()
 
         if self.ui:
             self.ui.vae_latency = (time.perf_counter() - vae_start) * 1000
@@ -643,8 +645,9 @@ def train():
     ui = TrainingUI()
     env = CrossyGameEnv(ui)
 
-    # Action Dim is now 4 (Up, Left, Right, Idle)
-    ppo = PPO(257, 4)
+    # State Dim: 12,800 (Spatial Grid) + 1 (X-Coord) = 12,801
+    # Action Dim: 4 (Up, Left, Right, Idle)
+    ppo = PPO(12801, 4)
     memory = Memory()
 
     start_episode = 1

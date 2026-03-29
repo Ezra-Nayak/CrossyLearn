@@ -11,7 +11,7 @@ from vision import VisionSystem
 
 # --- CONFIG ---
 WINDOW_TITLE = "Crossy Road"
-VAE_CHECKPOINT = "checkpoints/crossy_vae_ep500.pth"
+VAE_CHECKPOINT = "checkpoints/crossy_vae_best.pth"
 DISPLAY_SCALE = 5  # Scales up the 160x160 images for easier viewing
 
 
@@ -91,8 +91,8 @@ def main():
 
             # --- FORWARD PASS ---
             with torch.no_grad():
-                # VQ-VAE returns: recon, pred, vq_loss_c, vq_loss_t, perp_c, perp_t
-                recon, pred, _, _, perp_c, perp_t = vae(tensor_in)
+                # VQ-VAE returns: recon, pred, vq_loss_c, vq_loss_t, perp_c, perp_t, quant_c, quant_t
+                recon, pred, _, _, perp_c, perp_t, _, _ = vae(tensor_in)
 
             # Extract images to CPU numpy (Convert back to 0-255 uint8)
             img_input = stack[3]  # The current reference frame
@@ -116,12 +116,12 @@ def main():
             vis_pred = cv2.cvtColor((img_pred * 255).astype(np.uint8), cv2.COLOR_GRAY2BGR)
 
             # Add Text Labels
-            cv2.putText(vis_input, "1. Input (What Agent Sees)", (5, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
-            cv2.putText(vis_recon, "2. Recon (Context Brain)", (5, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 100, 100),
+            cv2.putText(vis_input, "1. Input", (5, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
+            cv2.putText(vis_recon, "2. Recon", (5, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 100, 100),
                         1)
-            cv2.putText(vis_pred, "3. Trend (Next Frame Prediction)", (5, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.4,
+            cv2.putText(vis_pred, "3. Trend", (5, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.4,
                         (100, 255, 100), 1)
-            cv2.putText(error_heatmap, "4. Error Map (Red = Bad)", (5, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.4,
+            cv2.putText(error_heatmap, "4. Error Map", (5, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.4,
                         (255, 255, 255), 1)
 
             # Assemble Grid

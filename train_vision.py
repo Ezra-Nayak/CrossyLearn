@@ -128,35 +128,32 @@ class VectorQuantizer(nn.Module):
         # inputs shape: [Batch, Channels, Height, Width]
         flat_inputs = inputs.permute(0, 2, 3, 1).contiguous().view(-1, self.embedding_dim)
 
-        # Calculate distances to find nearest codebook vectors
-        distances = (torch.sum(flat_inputs ** 2, dim=1, keepdim=True)
-                     + torch.sum(self.embedding.weight ** 2, dim=1)
-                     - 2 * torch.matmul(flat_inputs, self.embedding.weight.t()))
+        # --- SOTA FIX: Spherical VQ (Cosine Similarity) ---
+        # L2 Normalize inputs and weights to route by pattern/shape, not magnitude.
+        # This prevents background textures from "hoarding" codebook entries.
+        flat_norm = F.normalize(flat_inputs, p=2, dim=1)
+        weight_norm = F.normalize(self.embedding.weight, p=2, dim=1)
+
+        # Distance is (1 - cosine_similarity). Result range [0, 2]
+        distances = 1.0 - torch.matmul(flat_norm, weight_norm.t())
 
         encoding_indices = torch.argmin(distances, dim=1).unsqueeze(1)
 
         # --- SOTA FIX: DEAD CODE REVIVAL (DML Optimized) ---
         if self.training:
-            # Create a temporary one-hot matrix to track usage across the batch
-            # We use the 2D scatter pattern which is confirmed working on your DML setup
             usage_map = torch.zeros(encoding_indices.shape[0], self.num_embeddings, device=inputs.device)
             usage_map.scatter_(1, encoding_indices, 1)
 
-            # Sum across all pixels in the batch to get usage per codebook entry
             usage_count = torch.sum(usage_map, dim=0)
             dead_codes = torch.nonzero(usage_count == 0).squeeze(-1)
 
             if dead_codes.numel() > 0:
-                # Teleport dead codes directly onto random latent patches from this batch
                 rand_indices = torch.randint(0, flat_inputs.shape[0], (dead_codes.numel(),), device=inputs.device)
-
-                # Update codebook weights with actual latent data (Revival)
                 self.embedding.weight.data[dead_codes] = flat_inputs[rand_indices].detach()
 
-                # Recompute distances so the final quantization uses the new codes immediately
-                distances = (torch.sum(flat_inputs ** 2, dim=1, keepdim=True)
-                             + torch.sum(self.embedding.weight ** 2, dim=1)
-                             - 2 * torch.matmul(flat_inputs, self.embedding.weight.t()))
+                # Recompute Spherical Distances after revival
+                weight_norm = F.normalize(self.embedding.weight, p=2, dim=1)
+                distances = 1.0 - torch.matmul(flat_norm, weight_norm.t())
                 encoding_indices = torch.argmin(distances, dim=1).unsqueeze(1)
         # -----------------------------------
 
@@ -190,7 +187,9 @@ class SpatialVQVAE(nn.Module):
         self.num_embeddings = 512
         self.embedding_dim = 64
 
-        # --- ENCODER (160x160 Input -> 10x10 Spatial Grid) ---
+        # --- ENCODER (160x160 Input -> 20x20 Spatial Grid) ---
+        # SOTA FIX: We use a 20x20 grid (8x8 pixel patches) instead of 10x10.
+        # This prevents the chicken (roughly 8x10px) from being "smeared" into the background.
         self.encoder = nn.Sequential(
             nn.Conv2d(STACK_SIZE, 32, kernel_size=4, stride=2, padding=1),  # 80x80
             nn.BatchNorm2d(32),
@@ -204,7 +203,7 @@ class SpatialVQVAE(nn.Module):
             nn.BatchNorm2d(128),
             nn.LeakyReLU(0.2),
 
-            nn.Conv2d(128, 128, kernel_size=4, stride=2, padding=1),  # 10x10, 128 Channels (64 Context + 64 Trend)
+            nn.Conv2d(128, 128, kernel_size=3, stride=1, padding=1),  # 20x20, 128 Channels (Stride 1)
             nn.BatchNorm2d(128),
             nn.LeakyReLU(0.2),
         )
@@ -213,10 +212,9 @@ class SpatialVQVAE(nn.Module):
         self.vq_c = VectorQuantizer(self.num_embeddings, self.embedding_dim)
         self.vq_t = VectorQuantizer(self.num_embeddings, self.embedding_dim)
 
-        # --- DECODER (10x10 Grid -> 160x160 Image) ---
-        # Note: We NO LONGER FLATTEN. The decoder reconstructs directly from the spatial 10x10 map!
+        # --- DECODER (20x20 Grid -> 160x160 Image) ---
         self.decoder = nn.Sequential(
-            nn.ConvTranspose2d(self.embedding_dim, 128, kernel_size=4, stride=2, padding=1),  # 20x20
+            nn.ConvTranspose2d(self.embedding_dim, 128, kernel_size=3, stride=1, padding=1),  # 20x20 (Stride 1)
             nn.BatchNorm2d(128),
             nn.ReLU(),
 
@@ -245,7 +243,28 @@ class SpatialVQVAE(nn.Module):
         recon_static = self.decoder(quantized_c)
         pred_next = self.decoder(quantized_t)
 
-        return recon_static, pred_next, vq_loss_c, vq_loss_t, perplexity_c, perplexity_t
+        # Added quantized_c and quantized_t to the return signature for the PPO agent
+        return recon_static, pred_next, vq_loss_c, vq_loss_t, perplexity_c, perplexity_t, quantized_c, quantized_t
+
+
+def sobel_loss(pred, target, device):
+    """
+    Penalizes the network for smudging sharp edges.
+    Crucial for capturing the chicken and car outlines in Crossy Road.
+    """
+    # Sobel kernels for X and Y direction
+    kx = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32, device=device).view(1, 1, 3, 3)
+    ky = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32, device=device).view(1, 1, 3, 3)
+
+    edge_x_p = F.conv2d(pred, kx, padding=1)
+    edge_y_p = F.conv2d(pred, ky, padding=1)
+    edge_p = torch.sqrt(edge_x_p ** 2 + edge_y_p ** 2 + 1e-6)
+
+    edge_x_t = F.conv2d(target, kx, padding=1)
+    edge_y_t = F.conv2d(target, ky, padding=1)
+    edge_t = torch.sqrt(edge_x_t ** 2 + edge_y_t ** 2 + 1e-6)
+
+    return F.l1_loss(edge_p, edge_t, reduction='none')
 
 
 def verify_vae(model, val_loader, epoch):
@@ -255,7 +274,9 @@ def verify_vae(model, val_loader, epoch):
     with torch.no_grad():
         inputs, targets = next(iter(val_loader))
         inputs = inputs.to(DEVICE)
-        recon, pred, _, _, _, _ = model(inputs)
+
+        # Unpack 8 values (ignoring the last 6 for verification)
+        recon, pred, _, _, _, _, _, _ = model(inputs)
 
         # Grab first sample
         img_stack = inputs[0].cpu().numpy()
@@ -327,7 +348,9 @@ def train():
     optimizer = DMLAdam(model.parameters(), lr=LR, weight_decay=1e-4)
 
     print(f"[TRAIN] Starting on {DEVICE} with {train_size} train and {val_size} val samples.")
-    best_val_loss = float('inf')
+
+    # Track Best Visual Fidelity instead of Best L1 Loss
+    best_fidelity_score = 0.0
 
     for epoch in range(start_epoch, EPOCHS + 1):
         model.train()
@@ -336,27 +359,41 @@ def train():
         for batch_idx, (inputs, targets) in enumerate(train_loader):
             inputs, targets = inputs.to(DEVICE), targets.to(DEVICE)
 
-            # Prevent Overfitting: Random Horizontal Flip (Doubles effective dataset size)
             if torch.rand(1).item() > 0.5:
                 inputs = torch.flip(inputs, dims=[3])
                 targets = torch.flip(targets, dims=[3])
 
             current_frame = inputs[:, 3:4, :, :]
 
-            # Prevent Overfitting: Stronger Denoising & Spatial Dropout
+            # --- SOTA FIX: DYNAMIC MOTION-ATTENTION MASK ---
+            # Automatically detects the player and moving hazards (cars/logs) regardless of camera drift.
+            # Subtracts previous frame (t-1) from current (t) to find moving objects.
+            motion_diff = torch.abs(inputs[:, 3:4, :, :] - inputs[:, 2:3, :, :])
+            dynamic_mask = (motion_diff > 0.05).float() * 4.0 + 1.0  # 5x penalty for moving objects
+
+            # Add subtle center bias for the player (who usually stays centered vertically)
+            center_bias = torch.ones_like(current_frame)
+            center_bias[:, :, 50:140, 50:110] = 1.5
+
+            master_mask = dynamic_mask * center_bias
+
             noise = torch.randn_like(inputs) * 0.1
             noisy_inputs = torch.clamp(inputs + noise, 0.0, 1.0)
+            dropout_mask = (torch.rand_like(inputs[:, 0:1, :, :]) > 0.05).float()
+            noisy_inputs = noisy_inputs * dropout_mask
 
-            mask = (torch.rand_like(inputs[:, 0:1, :, :]) > 0.05).float()
-            noisy_inputs = noisy_inputs * mask
+            recon, pred, vq_loss_c, vq_loss_t, perp_c, perp_t, _, _ = model(noisy_inputs)
 
-            recon, pred, vq_loss_c, vq_loss_t, perp_c, perp_t = model(noisy_inputs)
+            # --- SOTA FIX: SOBEL + FOVEATED L1 ---
+            # Combined L1 (color) and Sobel (sharpness) loss focused by the Dynamic Mask.
+            l1_c = F.l1_loss(recon, current_frame, reduction='none')
+            edge_c = sobel_loss(recon, current_frame, DEVICE)
+            loss_context = torch.mean((l1_c + edge_c) * master_mask)
 
-            # Perceptual Spatial loss
-            loss_context = F.l1_loss(recon, current_frame)
-            loss_trend = F.l1_loss(pred, targets)
+            l1_t = F.l1_loss(pred, targets, reduction='none')
+            edge_t = sobel_loss(pred, targets, DEVICE)
+            loss_trend = torch.mean((l1_t + edge_t) * master_mask)
 
-            # KLD is replaced natively by Vector Quantization Commitment Loss
             loss = loss_context + (2.0 * loss_trend) + vq_loss_c + vq_loss_t
 
             optimizer.zero_grad()
@@ -370,30 +407,64 @@ def train():
         # Validation Loop
         model.eval()
         val_loss = 0
+        val_var_preserve = 0.0
+        val_perp_c = 0.0
+        val_perp_t = 0.0
+
         with torch.no_grad():
             for val_inputs, val_targets in val_loader:
                 val_inputs, val_targets = val_inputs.to(DEVICE), val_targets.to(DEVICE)
                 val_current = val_inputs[:, 3:4, :, :]
 
-                v_recon, v_pred, v_vq_loss_c, v_vq_loss_t, v_perp_c, v_perp_t = model(val_inputs)
+                # Replicate the Dynamic Mask for Validation consistency
+                v_motion_diff = torch.abs(val_inputs[:, 3:4, :, :] - val_inputs[:, 2:3, :, :])
+                v_dynamic_mask = (v_motion_diff > 0.05).float() * 4.0 + 1.0
+                v_center_bias = torch.ones_like(val_current)
+                v_center_bias[:, :, 50:140, 50:110] = 1.5
+                v_master_mask = v_dynamic_mask * v_center_bias
 
-                v_loss_context = F.l1_loss(v_recon, val_current)
-                v_loss_trend = F.l1_loss(v_pred, val_targets)
+                # Unpack 8 values from the model
+                v_results = model(val_inputs)
+                v_recon, v_pred, v_vq_loss_c, v_vq_loss_t, v_perp_c, v_perp_t, _, _ = v_results
+
+                # Calculate validation loss using same Sobel + Dynamic logic as training
+                v_l1_c = F.l1_loss(v_recon, val_current, reduction='none')
+                v_edge_c = sobel_loss(v_recon, val_current, DEVICE)
+                v_loss_context = torch.mean((v_l1_c + v_edge_c) * v_master_mask)
+
+                v_l1_t = F.l1_loss(v_pred, val_targets, reduction='none')
+                v_edge_t = sobel_loss(v_pred, val_targets, DEVICE)
+                v_loss_trend = torch.mean((v_l1_t + v_edge_t) * v_master_mask)
 
                 v_loss = v_loss_context + (2.0 * v_loss_trend) + v_vq_loss_c + v_vq_loss_t
                 val_loss += v_loss.item()
 
-        val_loss /= len(val_loader)
+                # Calculate Fidelity Metrics for saving
+                in_var = torch.var(val_current)
+                out_var = torch.var(v_recon)
+                val_var_preserve += (out_var / (in_var + 1e-8)).item()
+                val_perp_c += v_perp_c.item()
+                val_perp_t += v_perp_t.item()
+
+        num_val_batches = len(val_loader)
+        val_loss /= num_val_batches
+        avg_var_preserve = val_var_preserve / num_val_batches
+        avg_perp_c = val_perp_c / num_val_batches
+        avg_perp_t = val_perp_t / num_val_batches
+
+        # SOTA Metric: The Fidelity Score.
+        # Combines sharpness (variance) with token vocabulary size (perplexity).
+        fidelity_score = avg_var_preserve * (avg_perp_c + avg_perp_t)
 
         if epoch % 50 == 0 or epoch == 1:
-            print(f"Epoch {epoch} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
+            print(
+                f"Epoch {epoch} | Train Loss: {train_loss:.4f} | Fidelity Score: {fidelity_score:.1f} (VP: {avg_var_preserve * 100:.1f}%)")
             verify_vae(model, val_loader, epoch)
 
-        # Save Best Validation Model (Early Stopping / Prevent Overfitting)
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
+        # Save Best Validation Model using Human-Aligned Fidelity Metric
+        if fidelity_score > best_fidelity_score:
+            best_fidelity_score = fidelity_score
             torch.save(model.state_dict(), f"{CHECKPOINT_DIR}/crossy_vae_best.pth")
-
         if epoch % 100 == 0:
             torch.save(model.state_dict(), f"{CHECKPOINT_DIR}/crossy_vae_ep{epoch}.pth")
             print(f"[SAVE] Permanent checkpoint saved at epoch {epoch}")

@@ -470,13 +470,14 @@ class CrossyGameEnv:
         norm_x = self.last_known_coords[0] / 5.0
         state_vec = np.concatenate([latents, [norm_x]])
 
-        # Action Masking: 0:Up, 1:Left, 2:Right
-        action_mask = np.zeros(3, dtype=np.float32)
+        # Action Masking: 0:Up, 1:Left, 2:Right, 3:Idle
+        action_mask = np.zeros(4, dtype=np.float32)
 
         # 1. First Move Restriction: Force 'Up' (Index 0)
         if self.steps_in_episode == 0:
             action_mask[1] = -1e8  # Mask Left
             action_mask[2] = -1e8  # Mask Right
+            action_mask[3] = -1e8  # Mask Idle
         else:
             # 2. Boundary Masking: Prevent walking off map edges
             if self.last_known_coords[0] <= -4:
@@ -547,7 +548,7 @@ class CrossyGameEnv:
         return self.reset()
 
     def step(self, action):
-        # Action: 0:Up, 1:Left, 2:Right
+        # Action: 0:Up, 1:Left, 2:Right, 3:Idle
         if action == 0:
             pydirectinput.press('up')
             time.sleep(0.15) # Wait for jump animation to physically resolve
@@ -556,6 +557,9 @@ class CrossyGameEnv:
             time.sleep(0.15)
         elif action == 2:
             pydirectinput.press('right')
+            time.sleep(0.15)
+        elif action == 3:
+            # IDLE: Stand perfectly still and wait for traffic/logs
             time.sleep(0.15)
 
         self.steps_in_episode += 1
@@ -639,8 +643,8 @@ def train():
     ui = TrainingUI()
     env = CrossyGameEnv(ui)
 
-    # Action Dim is now 3 (Up, Left, Right)
-    ppo = PPO(257, 3)
+    # Action Dim is now 4 (Up, Left, Right, Idle)
+    ppo = PPO(257, 4)
     memory = Memory()
 
     start_episode = 1
@@ -684,7 +688,7 @@ def train():
                     ui.ppo_latency = (time.perf_counter() - ppo_start) * 1000
 
                     # Record action in UI
-                    action_map = {0: "Up", 1: "Left", 2: "Right"}
+                    action_map = {0: "Up", 1: "Left", 2: "Right", 3: "Idle"}
                     ui.last_action = action_map.get(action, "Unknown")
 
                     # Execute
@@ -750,7 +754,7 @@ def train():
                 ui.log(f"Ep {i_episode} ended | Reward: {current_ep_reward:.2f} | Score: {env.last_score}")
 
                 # Save Checkpoint
-                if i_episode % 50 == 0:
+                if i_episode % 100 == 0:
                     torch.save(ppo.policy.state_dict(), f"checkpoints/ppo_crossy_{i_episode}.pth")
                     ui.log(f"[SAVE] Checkpoint saved for Ep {i_episode}")
 

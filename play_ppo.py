@@ -7,7 +7,7 @@ import numpy as np
 from train_ppo import CrossyGameEnv, ActorCritic, PPO_DEVICE
 
 # --- CONFIG ---
-CHECKPOINT_PATH = "checkpoints/ppo_crossy_2950.pth"
+CHECKPOINT_PATH = "checkpoints/ppo_crossy_1000.pth"
 
 
 def play():
@@ -28,7 +28,7 @@ def play():
     print("[INFO] Bring game to front. Starting in 3 seconds...")
     time.sleep(3)
 
-    episodes = 5
+    episodes = 10
     for ep in range(1, episodes + 1):
         state, action_mask = env.reset()
         done = False

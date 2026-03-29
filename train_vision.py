@@ -189,12 +189,8 @@ class SplitBrainVAE(nn.Module):
         z_c = self.reparameterize(mu_c, log_c)
         z_t = self.reparameterize(mu_t, log_t)
 
-        # Regularize the latent variables structurally
-        z_c_dropped = F.dropout(z_c, p=0.2, training=self.training)
-        z_t_dropped = F.dropout(z_t, p=0.2, training=self.training)
-
-        recon_static = self.decode(z_c_dropped)
-        pred_next = self.decode(z_t_dropped)
+        recon_static = self.decode(z_c)
+        pred_next = self.decode(z_t)
 
         return recon_static, pred_next, mu_c, log_c, mu_t, log_t
 
@@ -303,16 +299,16 @@ def train():
 
             recon, pred, mu_c, log_c, mu_t, log_t = model(noisy_inputs)
 
-            loss_context = F.mse_loss(recon, current_frame)
-            loss_trend = F.mse_loss(pred, targets)
+            # L1 Loss heavily penalizes blurriness and forces sharper edges compared to MSE
+            loss_context = F.l1_loss(recon, current_frame)
+            loss_trend = F.l1_loss(pred, targets)
 
             kld = -0.5 * torch.sum(1 + log_c - mu_c.pow(2) - log_c.exp())
             kld += -0.5 * torch.sum(1 + log_t - mu_t.pow(2) - log_t.exp())
             kld /= (BATCH_SIZE * 2)
 
-            # EXPERIMENTAL: Increased KLD to structure the latent space better.
-            # Increased slightly to penalize complex latent structures that overfit.
-            KLD_WEIGHT = 0.00005
+            # Lower KLD to give the VAE more capacity to encode sharp, high-frequency details
+            KLD_WEIGHT = 0.000005
             loss = loss_context + (2.0 * loss_trend) + (KLD_WEIGHT * kld)
 
             optimizer.zero_grad()
@@ -333,8 +329,8 @@ def train():
 
                 v_recon, v_pred, v_mu_c, v_log_c, v_mu_t, v_log_t = model(val_inputs)
 
-                v_loss_context = F.mse_loss(v_recon, val_current)
-                v_loss_trend = F.mse_loss(v_pred, val_targets)
+                v_loss_context = F.l1_loss(v_recon, val_current)
+                v_loss_trend = F.l1_loss(v_pred, val_targets)
 
                 v_kld = -0.5 * torch.sum(1 + v_log_c - v_mu_c.pow(2) - v_log_c.exp())
                 v_kld += -0.5 * torch.sum(1 + v_log_t - v_mu_t.pow(2) - v_log_t.exp())

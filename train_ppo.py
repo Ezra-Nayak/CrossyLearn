@@ -386,8 +386,8 @@ class CrossyGameEnv:
                 os.system(f'start "" "{EXECUTABLE_PATH}"')
 
                 # Wait for load (WindowsApps can be slow)
-                self._log("[RECOVERY] Waiting 9 seconds for startup...")
-                time.sleep(9)
+                self._log("[RECOVERY] Waiting 7 seconds for startup...")
+                time.sleep(7)
 
                 self.hwnd = win32gui.FindWindow(None, WINDOW_TITLE)
                 if not self.hwnd:
@@ -470,13 +470,19 @@ class CrossyGameEnv:
         norm_x = self.last_known_coords[0] / 5.0
         state_vec = np.concatenate([latents, [norm_x]])
 
-        # Action Masking: 0:Idle, 1:Up, 2:Left, 3:Right
-        # Prevent the agent from walking off the visible map edges
-        action_mask = np.zeros(4, dtype=np.float32)
-        if self.last_known_coords[0] <= -4:
-            action_mask[2] = -1e8  # Heavily penalize Left
-        elif self.last_known_coords[0] >= 4:
-            action_mask[3] = -1e8  # Heavily penalize Right
+        # Action Masking: 0:Up, 1:Left, 2:Right
+        action_mask = np.zeros(3, dtype=np.float32)
+
+        # 1. First Move Restriction: Force 'Up' (Index 0)
+        if self.steps_in_episode == 0:
+            action_mask[1] = -1e8  # Mask Left
+            action_mask[2] = -1e8  # Mask Right
+        else:
+            # 2. Boundary Masking: Prevent walking off map edges
+            if self.last_known_coords[0] <= -4:
+                action_mask[1] = -1e8  # Heavily penalize Left
+            elif self.last_known_coords[0] >= 4:
+                action_mask[2] = -1e8  # Heavily penalize Right
 
         # Use Z axis directly as the continuous score (progress tracker)
         current_score = self.last_known_coords[1]
@@ -487,8 +493,8 @@ class CrossyGameEnv:
             self.ui.game_state = "PLAYING" if data['pause_visible'] else "DEAD/MENU"
 
             mask_str = []
-            if action_mask[2] < -1: mask_str.append("L")
-            if action_mask[3] < -1: mask_str.append("R")
+            if action_mask[1] < -1: mask_str.append("L")
+            if action_mask[2] < -1: mask_str.append("R")
             self.ui.action_mask_status = f"Restricted: {','.join(mask_str)}" if mask_str else "Free"
 
         return state_vec, current_score, data['pause_visible'], action_mask
@@ -541,57 +547,44 @@ class CrossyGameEnv:
         return self.reset()
 
     def step(self, action):
-        # Action: 0:Idle, 1:Up, 2:Left, 3:Right
-        if action == 1:
+        # Action: 0:Up, 1:Left, 2:Right
+        if action == 0:
             pydirectinput.press('up')
-        elif action == 2:
+            time.sleep(0.15) # Wait for jump animation to physically resolve
+        elif action == 1:
             pydirectinput.press('left')
-        elif action == 3:
+            time.sleep(0.15)
+        elif action == 2:
             pydirectinput.press('right')
+            time.sleep(0.15)
 
-        self.steps_in_episode += 1  # Increment step counter
-
-        # SYNCED EXECUTION:
-        # We removed the manual sleep. The loop now blocks on 'get_state()',
-        # which effectively waits for the Vision thread's 10 FPS (100ms) heartbeat.
+        self.steps_in_episode += 1
         next_state, score, is_alive, action_mask = self.get_state()
 
-        # --- REWARD ENGINEERING ---
-        # BASE STEP PENALTY: Super small. Agent can survive and wait for cars to pass.
-        reward = -0.002
+        # Start with 0 reward. Let the Eagle act as the "Time Penalty".
+        reward = 0.0
         done = False
 
-        # 1. Progression Reward (Using Z Coordinate)
         if score > self.last_score:
-            # Z increases by exactly 1.0 per grid hop forward
-            reward += 2.0 * (score - self.last_score)  # Slightly more aggressive progress reward
-
-            # --- MILESTONE BONUS ---
+            reward += 1.0 * (score - self.last_score) # Reduced immediate gratification
             if score >= self.next_milestone:
                 reward += 5.0
                 self._log(f"[BONUS] Milestone reached! Z-Score: {score}")
                 self.next_milestone += 10
-            # -----------------------
-
             self.last_score = score
             self.steps_stationary = 0
         elif score < self.last_score:
-            # INNOVATION: Penalize stepping backward.
-            # We use 2.0 to match the forward reward, making "back-and-forth" a net zero or loss.
-            reward -= 2.0 * (self.last_score - score)
+            reward -= 1.0 * (self.last_score - score) # Penalize retreating
             self.last_score = score
             self.steps_stationary = 0
 
-        # 2. Idle Penalty / Sideways Penalty
-        if action == 0:
-            reward -= 0.015  # SOTA: Allow agent to be patient. Was -0.1.
-            self.steps_stationary += 1
-        elif action == 2 or action == 3:
-            reward -= 0.001  # Almost negligible, allows tactical dodging.
+        # Stronger sideways penalty to discourage stalling tactics
+        if action == 1 or action == 2:
+            reward -= 0.1
 
         # 3. Death Detection
         if not is_alive:
-            reward = -10.0
+            reward = -15.0 # Harsher death penalty out-weighs suicide rushing
             done = True
 
         return next_state, reward, done, action_mask
@@ -646,8 +639,8 @@ def train():
     ui = TrainingUI()
     env = CrossyGameEnv(ui)
 
-    # State Dim is now 257 (256 Latents + 1 Normalized X)
-    ppo = PPO(257, 4)
+    # Action Dim is now 3 (Up, Left, Right)
+    ppo = PPO(257, 3)
     memory = Memory()
 
     start_episode = 1
@@ -669,7 +662,6 @@ def train():
 
             ui.log("Focus the game window! Starting in 3 seconds...")
             ui.refresh(live, force=True)
-            time.sleep(3)
 
             time_step = 0
 
@@ -692,7 +684,7 @@ def train():
                     ui.ppo_latency = (time.perf_counter() - ppo_start) * 1000
 
                     # Record action in UI
-                    action_map = {0: "Idle", 1: "Up", 2: "Left", 3: "Right"}
+                    action_map = {0: "Up", 1: "Left", 2: "Right"}
                     ui.last_action = action_map.get(action, "Unknown")
 
                     # Execute

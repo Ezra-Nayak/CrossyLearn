@@ -40,7 +40,7 @@ class GameCrashedError(Exception):
 class CrossyEnv:
     def __init__(self):
         self.sct = mss.mss()
-        self.action_space = 4  # 0:Idle, 1:Up, 2:Left, 3:Right
+        self.action_space = 3  # 0:Up, 1:Left, 2:Right
         self.grid_radius = 3
         self.state_dim = ((self.grid_radius * 2 + 1) ** 2) + 1
         self.steps_in_episode = 0
@@ -248,11 +248,11 @@ class CrossyEnv:
             print("[ENV] Warning: 'Left' attempted on first move. Ignoring.")
             action = 0  # Force Idle
 
-        if action == 1:
+        if action == 0:
             pydirectinput.press('up')
-        elif action == 2:
+        elif action == 1:
             pydirectinput.press('left')
-        elif action == 3:
+        elif action == 2:
             pydirectinput.press('right')
 
         self.steps_in_episode += 1

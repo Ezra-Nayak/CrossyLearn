@@ -25,7 +25,7 @@ from rich.panel import Panel
 from rich.align import Align
 from rich.table import Table
 
-from train_vision import SplitBrainVAE, setup_device
+from train_vision import SpatialVQVAE, setup_device
 from vision import VisionSystem
 from tracker import RamTracker
 
@@ -208,7 +208,8 @@ class TrainingUI:
 class Memory:
     def __init__(self):
         self.actions = []
-        self.states =[]
+        self.states_latent = []
+        self.states_scalar =[]
         self.logprobs = []
         self.rewards = []
         self.is_terminals =[]
@@ -217,7 +218,8 @@ class Memory:
 
     def clear(self):
         del self.actions[:]
-        del self.states[:]
+        del self.states_latent[:]
+        del self.states_scalar[:]
         del self.logprobs[:]
         del self.rewards[:]
         del self.is_terminals[:]
@@ -232,20 +234,33 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
 
 
 class ActorCritic(nn.Module):
-    def __init__(self, state_dim, action_dim):
+    def __init__(self, action_dim):
         super(ActorCritic, self).__init__()
+
+        # SOTA: Spatial CNN to process the 128x20x20 Split-Brain Latents natively.
+        # This keeps the spatial relationship of cars to the chicken intact without 26M flattened weights.
+        self.cnn = nn.Sequential(
+            nn.Conv2d(128, 64, kernel_size=3, stride=2, padding=1),  # -> 64x10x10
+            nn.ReLU(),
+            nn.Conv2d(64, 32, kernel_size=3, stride=2, padding=1),  # -> 32x5x5
+            nn.ReLU(),
+            nn.Flatten()  # -> 32 * 5 * 5 = 800 flat features
+        )
+
+        cnn_out_dim = 800
+        scalar_dim = 1  # X-coordinate normalization
 
         # SOTA: Disjoint networks prevent destructive interference between Actor and Critic
         self.actor = nn.Sequential(
-            layer_init(nn.Linear(state_dim, HIDDEN_DIM)),
+            layer_init(nn.Linear(cnn_out_dim + scalar_dim, HIDDEN_DIM)),
             nn.Tanh(),
             layer_init(nn.Linear(HIDDEN_DIM, HIDDEN_DIM)),
             nn.Tanh(),
-            layer_init(nn.Linear(HIDDEN_DIM, action_dim), std=0.01)  # Low std for initial exploration
+            layer_init(nn.Linear(HIDDEN_DIM, action_dim), std=0.01)
         )
 
         self.critic = nn.Sequential(
-            layer_init(nn.Linear(state_dim, HIDDEN_DIM)),
+            layer_init(nn.Linear(cnn_out_dim + scalar_dim, HIDDEN_DIM)),
             nn.Tanh(),
             layer_init(nn.Linear(HIDDEN_DIM, HIDDEN_DIM)),
             nn.Tanh(),
@@ -255,23 +270,38 @@ class ActorCritic(nn.Module):
     def forward(self):
         raise NotImplementedError
 
-    def act(self, state, action_mask):
-        action_logits = self.actor(state)
+    def _get_features(self, latents, scalars):
+        # Ensure latents have batch dimension:[B, 128, 20, 20]
+        if latents.dim() == 3:
+            latents = latents.unsqueeze(0)
 
-        # Action Masking: Add massive negative penalty to logits of invalid actions
+        cnn_out = self.cnn(latents)
+
+        # Ensure scalars have batch dimension: [B, 1]
+        if scalars.dim() == 1:
+            scalars = scalars.unsqueeze(1)
+
+        return torch.cat([cnn_out, scalars], dim=1)
+
+    def act(self, latents, scalars, action_mask):
+        features = self._get_features(latents, scalars)
+        action_logits = self.actor(features)
+
         if action_mask is not None:
+            if action_mask.dim() == 1:
+                action_mask = action_mask.unsqueeze(0)
             action_logits = action_logits + action_mask
 
-        # Passing logits directly is numerically more stable than explicit Softmax
         dist = Categorical(logits=action_logits)
         action = dist.sample()
         action_logprob = dist.log_prob(action)
-        state_value = self.critic(state)
+        state_value = self.critic(features)
 
         return action.item(), action_logprob.item(), state_value.item()
 
-    def evaluate(self, state, action, action_mask):
-        action_logits = self.actor(state)
+    def evaluate(self, latents, scalars, action, action_mask):
+        features = self._get_features(latents, scalars)
+        action_logits = self.actor(features)
 
         if action_mask is not None:
             action_logits = action_logits + action_mask
@@ -279,23 +309,23 @@ class ActorCritic(nn.Module):
         dist = Categorical(logits=action_logits)
         action_logprobs = dist.log_prob(action)
         dist_entropy = dist.entropy()
-        state_values = self.critic(state)
+        state_values = self.critic(features)
 
         return action_logprobs, state_values, dist_entropy
 
 
 class PPO:
-    def __init__(self, state_dim, action_dim):
-        # Force PPO to CPU
-        self.policy = ActorCritic(state_dim, action_dim).to(PPO_DEVICE)
+    def __init__(self, action_dim):
+        # Force PPO to CPU. No state_dim needed, CNN handles it automatically.
+        self.policy = ActorCritic(action_dim).to(PPO_DEVICE)
         self.optimizer = optim.Adam(self.policy.parameters(), lr=LR)
-        self.policy_old = ActorCritic(state_dim, action_dim).to(PPO_DEVICE)
+        self.policy_old = ActorCritic(action_dim).to(PPO_DEVICE)
         self.policy_old.load_state_dict(self.policy.state_dict())
         self.MseLoss = nn.MSELoss()
 
     def update(self, memory):
         # SOTA: Generalized Advantage Estimation (GAE)
-        advantages = []
+        advantages =[]
         last_gae_lam = 0
 
         for step in reversed(range(len(memory.rewards))):
@@ -310,7 +340,7 @@ class PPO:
             last_gae_lam = delta + GAMMA * GAE_LAMBDA * next_non_terminal * last_gae_lam
             advantages.insert(0, last_gae_lam)
 
-        returns = [adv + val for adv, val in zip(advantages, memory.values)]
+        returns =[adv + val for adv, val in zip(advantages, memory.values)]
 
         # Convert to tensors
         returns = torch.tensor(returns, dtype=torch.float32).to(PPO_DEVICE)
@@ -320,13 +350,16 @@ class PPO:
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
         # Stack tensors (CPU)
-        old_states = torch.squeeze(torch.stack(memory.states, dim=0)).detach().to(PPO_DEVICE)
+        old_states_latent = torch.stack(memory.states_latent, dim=0).detach().to(PPO_DEVICE)
+        old_states_scalar = torch.stack(memory.states_scalar, dim=0).detach().to(PPO_DEVICE)
         old_actions = torch.squeeze(torch.stack(memory.actions, dim=0)).detach().to(PPO_DEVICE)
         old_logprobs = torch.squeeze(torch.stack(memory.logprobs, dim=0)).detach().to(PPO_DEVICE)
         old_masks = torch.squeeze(torch.stack(memory.action_masks, dim=0)).detach().to(PPO_DEVICE)
 
         for _ in range(K_EPOCHS):
-            logprobs, state_values, dist_entropy = self.policy.evaluate(old_states, old_actions, old_masks)
+            logprobs, state_values, dist_entropy = self.policy.evaluate(
+                old_states_latent, old_states_scalar, old_actions, old_masks
+            )
             state_values = torch.squeeze(state_values)
 
             ratios = torch.exp(logprobs - old_logprobs)
@@ -339,8 +372,9 @@ class PPO:
             # Critic loss
             critic_loss = 0.5 * self.MseLoss(state_values, returns)
 
-            # Total loss
-            loss = actor_loss + critic_loss - 0.01 * dist_entropy
+            # SOTA FIX: Higher Entropy Coef (0.05 vs 0.01) to cure cowardice
+            # and force reckless exploration of the map rather than freezing in fear.
+            loss = actor_loss + critic_loss - 0.05 * dist_entropy
 
             self.optimizer.zero_grad()
             loss.mean().backward()
@@ -352,7 +386,7 @@ class PPO:
 class CrossyGameEnv:
     def __init__(self, ui=None):
         self.ui = ui
-        self.vae = SplitBrainVAE().to(VAE_DEVICE)
+        self.vae = SpatialVQVAE().to(VAE_DEVICE)
         self.vae.load_state_dict(torch.load(VAE_CHECKPOINT, map_location=VAE_DEVICE, weights_only=False))
         self.vae.eval()
 
@@ -428,7 +462,7 @@ class CrossyGameEnv:
             if data is None:
                 data = self.vision_q.get(timeout=1.0)
         except queue.Empty:
-            return None, 0, True, {}  # Fail state
+            return None, None, 0, False, np.zeros(4, dtype=np.float32)  # Fail state
 
         frame = data['frame']
 
@@ -450,57 +484,52 @@ class CrossyGameEnv:
             # Spatial VQ-VAE returns 8 variables. We want the quantized spatial grids.
             _, _, _, _, _, _, quant_c, quant_t = self.vae(tensor_in)
 
-            # quant_c is [1, 64, 10, 10]. quant_t is [1, 64, 10, 10].
-            # Concatenate along channel dim -> [1, 128, 10, 10], then flatten to 12,800
-            latents = torch.cat([quant_c, quant_t], dim=1).cpu().numpy().flatten()
+            # quant_c is[1, 64, 20, 20]. quant_t is[1, 64, 20, 20].
+            # Concatenate along channel dim ->[1, 128, 20, 20]. Squeeze to [128, 20, 20].
+            # SOTA FIX: Do NOT flatten here! Keep spatial dimensions intact for the CNN.
+            latents = torch.cat([quant_c, quant_t], dim=1).squeeze(0).cpu().numpy()
 
         if self.ui:
             self.ui.vae_latency = (time.perf_counter() - vae_start) * 1000
 
         # 3. Proprioception & Score (RAM Tracking)
-        # Fetch coordinates automatically bypassing CV completely
         coords = self.ram_tracker.get_coords()
         if coords:
             raw_x, raw_y, raw_z = coords
-            # Grid align to prevent jump animation jitter (1.0 units per tile)
             grid_x = round(raw_x)
             grid_z = round(raw_z)
             self.last_known_coords = (grid_x, grid_z)
 
-        # SOTA Normalization: Remove Z (infinitely scaling score) from State.
-        # Normalize X (approx bounds -4 to 4) by dividing by 5.0 to map it tightly to [-1, 1]
+        # SOTA Normalization: Remove Z from State.
         norm_x = self.last_known_coords[0] / 5.0
-        state_vec = np.concatenate([latents, [norm_x]])
+        scalars = np.array([norm_x], dtype=np.float32)
 
         # Action Masking: 0:Up, 1:Left, 2:Right, 3:Idle
         action_mask = np.zeros(4, dtype=np.float32)
 
-        # 1. First Move Restriction: Force 'Up' (Index 0)
         if self.steps_in_episode == 0:
-            action_mask[1] = -1e8  # Mask Left
-            action_mask[2] = -1e8  # Mask Right
-            action_mask[3] = -1e8  # Mask Idle
+            action_mask[1] = -1e8
+            action_mask[2] = -1e8
+            action_mask[3] = -1e8
         else:
-            # 2. Boundary Masking: Prevent walking off map edges
             if self.last_known_coords[0] <= -4:
-                action_mask[1] = -1e8  # Heavily penalize Left
+                action_mask[1] = -1e8
             elif self.last_known_coords[0] >= 4:
-                action_mask[2] = -1e8  # Heavily penalize Right
+                action_mask[2] = -1e8
 
-        # Use Z axis directly as the continuous score (progress tracker)
         current_score = self.last_known_coords[1]
 
         if self.ui:
             self.ui.ram_x = self.last_known_coords[0]
             self.ui.ram_z = current_score
             self.ui.game_state = "PLAYING" if data['pause_visible'] else "DEAD/MENU"
-
-            mask_str = []
+            mask_str =[]
             if action_mask[1] < -1: mask_str.append("L")
             if action_mask[2] < -1: mask_str.append("R")
             self.ui.action_mask_status = f"Restricted: {','.join(mask_str)}" if mask_str else "Free"
 
-        return state_vec, current_score, data['pause_visible'], action_mask
+        # Return Latents and Scalars separately
+        return latents, scalars, current_score, data['pause_visible'], action_mask
 
     def reset(self):
         # 1. Crash Check
@@ -518,8 +547,15 @@ class CrossyGameEnv:
             # Click Retry / Tap to Start
             pydirectinput.moveTo(rx, ry)
             pydirectinput.click()
-            time.sleep(0.5)
-            pydirectinput.press('space')
+
+            # SOTA: UI Clearing & Fresh Start Sequence
+            # Forces the game to clear any "Tap to Start" overlays or initial menus.
+            # Sequence: Up, Right, Left, Right, Left
+            time.sleep(3)  # Wait for the very first "Space" jump to land
+            for cmd in ['up', 'right', 'left', 'right', 'left']:
+                pydirectinput.press(cmd)
+                time.sleep(0.25)  # Slightly longer delay to ensure UI clears and camera centers
+
         except Exception as e:
             self._log(f"[RECOVERY] Window manipulation failed (Target died): {e}")
             time.sleep(2)
@@ -537,23 +573,28 @@ class CrossyGameEnv:
         timeout_start = time.time()
         while time.time() - timeout_start < 5.0:  # 5 second timeout
             time.sleep(0.1)
-            state, z_score, is_alive, action_mask = self.get_state()
+            # Unpack all 5 values from get_state
+            lat_out, sca_out, z_score, is_alive, action_mask = self.get_state()
 
             # If vision is working AND game thinks we are alive:
-            if state is not None and is_alive:
-                # Sync initial score properly so it doesn't instantly penalize/reward
+            if lat_out is not None and is_alive:
                 self.last_score = z_score
                 self.next_milestone = self.last_score + 10
-                return state, action_mask
+                return lat_out, sca_out, action_mask
 
         # If we reach here, the game didn't start (missed click?). Retry reset.
         return self.reset()
 
     def step(self, action):
         # Action: 0:Up, 1:Left, 2:Right, 3:Idle
+
+        # SOTA FIX: Your implementation here is actually perfect!
+        # By sleeping here, we allow the 10-15 frame animation to play out.
+        # The subsequent get_state() flushes the OpenCV queue, guaranteeing
+        # the PPO agent receives the frame of the *landing*, bypassing mid-air blur.
         if action == 0:
             pydirectinput.press('up')
-            time.sleep(0.15) # Wait for jump animation to physically resolve
+            time.sleep(0.15)
         elif action == 1:
             pydirectinput.press('left')
             time.sleep(0.15)
@@ -561,18 +602,17 @@ class CrossyGameEnv:
             pydirectinput.press('right')
             time.sleep(0.15)
         elif action == 3:
-            # IDLE: Stand perfectly still and wait for traffic/logs
             time.sleep(0.15)
 
         self.steps_in_episode += 1
-        next_state, score, is_alive, action_mask = self.get_state()
+        latents, scalars, score, is_alive, action_mask = self.get_state()
 
-        # Start with 0 reward. Let the Eagle act as the "Time Penalty".
         reward = 0.0
         done = False
 
+        # SOTA REWARD SHAPING:
         if score > self.last_score:
-            reward += 1.0 * (score - self.last_score) # Reduced immediate gratification
+            reward += 1.0 * (score - self.last_score)
             if score >= self.next_milestone:
                 reward += 5.0
                 self._log(f"[BONUS] Milestone reached! Z-Score: {score}")
@@ -580,20 +620,25 @@ class CrossyGameEnv:
             self.last_score = score
             self.steps_stationary = 0
         elif score < self.last_score:
-            reward -= 1.0 * (self.last_score - score) # Penalize retreating
+            reward -= 1.0 * (self.last_score - score)
             self.last_score = score
             self.steps_stationary = 0
+        else:
+            # THE "TICK" PENALTY: Cure Cowardice.
+            # If the chicken didn't move forward or backward, it stood still (or moved sideways).
+            self.steps_stationary += 1
+            reward -= 0.05
 
-        # Stronger sideways penalty to discourage stalling tactics
+            # Stronger sideways penalty
         if action == 1 or action == 2:
             reward -= 0.1
 
-        # 3. Death Detection
+        # Death Detection
         if not is_alive:
-            reward = -15.0 # Harsher death penalty out-weighs suicide rushing
+            reward = -15.0  # Harsher death penalty out-weighs suicide rushing
             done = True
 
-        return next_state, reward, done, action_mask
+        return latents, scalars, reward, done, action_mask
 
 
 import glob
@@ -645,9 +690,8 @@ def train():
     ui = TrainingUI()
     env = CrossyGameEnv(ui)
 
-    # State Dim: 12,800 (Spatial Grid) + 1 (X-Coord) = 12,801
     # Action Dim: 4 (Up, Left, Right, Idle)
-    ppo = PPO(12801, 4)
+    ppo = PPO(4)
     memory = Memory()
 
     start_episode = 1
@@ -674,7 +718,7 @@ def train():
 
             for i_episode in range(start_episode, MAX_EPISODES + 1):
                 ui.current_ep = i_episode
-                state, action_mask = env.reset()
+                state_latent, state_scalar, action_mask = env.reset()
                 current_ep_reward = 0
 
                 # Safety Loop Break
@@ -683,11 +727,12 @@ def train():
                     time_step += 1
 
                     # Select Action (Move state to CPU for PPO)
-                    state_t = torch.FloatTensor(state).to(PPO_DEVICE)
+                    latent_t = torch.FloatTensor(state_latent).to(PPO_DEVICE)
+                    scalar_t = torch.FloatTensor(state_scalar).to(PPO_DEVICE)
                     mask_t = torch.FloatTensor(action_mask).to(PPO_DEVICE)
 
                     ppo_start = time.perf_counter()
-                    action, logprob, value = ppo.policy_old.act(state_t, mask_t)
+                    action, logprob, value = ppo.policy_old.act(latent_t, scalar_t, mask_t)
                     ui.ppo_latency = (time.perf_counter() - ppo_start) * 1000
 
                     # Record action in UI
@@ -696,17 +741,18 @@ def train():
 
                     # Execute
                     env_start = time.perf_counter()
-                    next_state, reward, done, next_action_mask = env.step(action)
+                    next_latents, next_scalars, reward, done, next_action_mask = env.step(action)
                     ui.env_latency = (time.perf_counter() - env_start) * 1000
 
                     # Handle Step Failure
-                    if next_state is None:
+                    if next_latents is None:
                         ui.log("[PPO] Step failed. Resetting...")
                         done = True
                         reward = -10.0
 
                     # Store (CPU)
-                    memory.states.append(state_t)
+                    memory.states_latent.append(latent_t)
+                    memory.states_scalar.append(scalar_t)
                     memory.actions.append(torch.tensor(action).to(PPO_DEVICE))
                     memory.logprobs.append(torch.tensor(logprob).to(PPO_DEVICE))
                     memory.rewards.append(reward)
@@ -714,7 +760,8 @@ def train():
                     memory.values.append(value)
                     memory.action_masks.append(mask_t)
 
-                    state = next_state
+                    state_latent = next_latents
+                    state_scalar = next_scalars
                     action_mask = next_action_mask
                     current_ep_reward += reward
 

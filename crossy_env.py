@@ -212,12 +212,7 @@ class CrossyEnv:
         ty = monitor['top'] + RETRY_CLICK_COORDS[1]
 
         self._focus_window()
-        time.sleep(0.1)
-        pydirectinput.moveTo(tx, ty)
-        pydirectinput.click()
-        time.sleep(0.5)
-        pydirectinput.press('space')
-        time.sleep(1.5)
+        time.sleep(2)
 
         frame = self.grab_frame()
         pos = self.find_chicken(frame)

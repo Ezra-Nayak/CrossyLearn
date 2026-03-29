@@ -68,7 +68,7 @@ class DMLAdam(Optimizer):
 # --- CONFIG ---
 BATCH_SIZE = 128        # Crank this up for stability
 LR = 1e-4               # Slightly lower for fine-tuning
-EPOCHS = 1000            # Let it run for a while
+EPOCHS = 500            # Let it run for a while
 LATENT_DIM = 256
 IMG_SIZE = 160
 STACK_SIZE = 4
@@ -114,11 +114,83 @@ class CrossyVisionDataset(Dataset):
         return torch.FloatTensor(input_stack), torch.FloatTensor(target_frame)
 
 
-class SplitBrainVAE(nn.Module):
-    def __init__(self):
-        super(SplitBrainVAE, self).__init__()
+class VectorQuantizer(nn.Module):
+    def __init__(self, num_embeddings, embedding_dim, commitment_cost=0.25):
+        super(VectorQuantizer, self).__init__()
+        self.num_embeddings = num_embeddings
+        self.embedding_dim = embedding_dim
+        self.commitment_cost = commitment_cost
 
-        # --- ENCODER (160x160 Input) ---
+        self.embedding = nn.Embedding(self.num_embeddings, self.embedding_dim)
+        self.embedding.weight.data.uniform_(-1 / self.num_embeddings, 1 / self.num_embeddings)
+
+    def forward(self, inputs):
+        # inputs shape: [Batch, Channels, Height, Width]
+        flat_inputs = inputs.permute(0, 2, 3, 1).contiguous().view(-1, self.embedding_dim)
+
+        # Calculate distances to find nearest codebook vectors
+        distances = (torch.sum(flat_inputs ** 2, dim=1, keepdim=True)
+                     + torch.sum(self.embedding.weight ** 2, dim=1)
+                     - 2 * torch.matmul(flat_inputs, self.embedding.weight.t()))
+
+        encoding_indices = torch.argmin(distances, dim=1).unsqueeze(1)
+
+        # --- SOTA FIX: DEAD CODE REVIVAL (DML Optimized) ---
+        if self.training:
+            # Create a temporary one-hot matrix to track usage across the batch
+            # We use the 2D scatter pattern which is confirmed working on your DML setup
+            usage_map = torch.zeros(encoding_indices.shape[0], self.num_embeddings, device=inputs.device)
+            usage_map.scatter_(1, encoding_indices, 1)
+
+            # Sum across all pixels in the batch to get usage per codebook entry
+            usage_count = torch.sum(usage_map, dim=0)
+            dead_codes = torch.nonzero(usage_count == 0).squeeze(-1)
+
+            if dead_codes.numel() > 0:
+                # Teleport dead codes directly onto random latent patches from this batch
+                rand_indices = torch.randint(0, flat_inputs.shape[0], (dead_codes.numel(),), device=inputs.device)
+
+                # Update codebook weights with actual latent data (Revival)
+                self.embedding.weight.data[dead_codes] = flat_inputs[rand_indices].detach()
+
+                # Recompute distances so the final quantization uses the new codes immediately
+                distances = (torch.sum(flat_inputs ** 2, dim=1, keepdim=True)
+                             + torch.sum(self.embedding.weight ** 2, dim=1)
+                             - 2 * torch.matmul(flat_inputs, self.embedding.weight.t()))
+                encoding_indices = torch.argmin(distances, dim=1).unsqueeze(1)
+        # -----------------------------------
+
+        encodings = torch.zeros(encoding_indices.shape[0], self.num_embeddings, device=inputs.device)
+        encodings.scatter_(1, encoding_indices, 1)
+
+        # Quantize the latents
+        quantized = torch.matmul(encodings, self.embedding.weight).view(inputs.shape[0], inputs.shape[2],
+                                                                        inputs.shape[3], self.embedding_dim)
+        quantized = quantized.permute(0, 3, 1, 2).contiguous()
+
+        # Loss calculation (Codebook loss + Commitment loss)
+        e_latent_loss = F.mse_loss(quantized.detach(), inputs)
+        q_latent_loss = F.mse_loss(quantized, inputs.detach())
+        loss = q_latent_loss + self.commitment_cost * e_latent_loss
+
+        # Straight-through estimator (passes gradients through the argmin)
+        quantized = inputs + (quantized - inputs).detach()
+
+        # Perplexity (Metric to ensure the whole codebook is being used, not just 1 or 2 codes)
+        avg_probs = torch.mean(encodings, dim=0)
+        perplexity = torch.exp(-torch.sum(avg_probs * torch.log(avg_probs + 1e-10)))
+
+        return quantized, loss, perplexity
+
+
+class SpatialVQVAE(nn.Module):
+    def __init__(self):
+        super(SpatialVQVAE, self).__init__()
+
+        self.num_embeddings = 512
+        self.embedding_dim = 64
+
+        # --- ENCODER (160x160 Input -> 10x10 Spatial Grid) ---
         self.encoder = nn.Sequential(
             nn.Conv2d(STACK_SIZE, 32, kernel_size=4, stride=2, padding=1),  # 80x80
             nn.BatchNorm2d(32),
@@ -132,25 +204,19 @@ class SplitBrainVAE(nn.Module):
             nn.BatchNorm2d(128),
             nn.LeakyReLU(0.2),
 
-            nn.Conv2d(128, 256, kernel_size=4, stride=2, padding=1),  # 10x10
-            nn.BatchNorm2d(256),
+            nn.Conv2d(128, 128, kernel_size=4, stride=2, padding=1),  # 10x10, 128 Channels (64 Context + 64 Trend)
+            nn.BatchNorm2d(128),
             nn.LeakyReLU(0.2),
         )
 
-        # 256 * 10 * 10 = 25600
-        self.flatten_size = 25600
-        self.split_dim = LATENT_DIM // 2
+        # Discrete Codebooks (One for Context Brain, One for Trend Brain)
+        self.vq_c = VectorQuantizer(self.num_embeddings, self.embedding_dim)
+        self.vq_t = VectorQuantizer(self.num_embeddings, self.embedding_dim)
 
-        self.fc_mu_c = nn.Linear(self.flatten_size, self.split_dim)
-        self.fc_log_c = nn.Linear(self.flatten_size, self.split_dim)
-        self.fc_mu_t = nn.Linear(self.flatten_size, self.split_dim)
-        self.fc_log_t = nn.Linear(self.flatten_size, self.split_dim)
-
-        # --- DECODER ---
-        self.decoder_input = nn.Linear(self.split_dim, self.flatten_size)
-
+        # --- DECODER (10x10 Grid -> 160x160 Image) ---
+        # Note: We NO LONGER FLATTEN. The decoder reconstructs directly from the spatial 10x10 map!
         self.decoder = nn.Sequential(
-            nn.ConvTranspose2d(256, 128, kernel_size=4, stride=2, padding=1),  # 20x20
+            nn.ConvTranspose2d(self.embedding_dim, 128, kernel_size=4, stride=2, padding=1),  # 20x20
             nn.BatchNorm2d(128),
             nn.ReLU(),
 
@@ -166,33 +232,20 @@ class SplitBrainVAE(nn.Module):
             nn.Sigmoid()
         )
 
-    def reparameterize(self, mu, logvar):
-        std = torch.exp(0.5 * logvar)
-        eps = torch.randn_like(std)
-        return mu + eps * std
-
-    def decode(self, z):
-        x = self.decoder_input(z)
-        x = x.view(-1, 256, 10, 10)  # Reshape to 10x10 feature map
-        return self.decoder(x)
-
     def forward(self, x):
-        h = self.encoder(x)
-        h = h.view(h.size(0), -1)
+        h = self.encoder(x)  # Shape:[B, 128, 10, 10]
 
-        # Add Dropout to prevent overfitting (no parameters, safe for loaded checkpoints)
-        h = F.dropout(h, p=0.3, training=self.training)
+        # Split the 128 channels physically down the middle: 64 for context, 64 for trend
+        z_c, z_t = torch.split(h, self.embedding_dim, dim=1)
 
-        mu_c, log_c = self.fc_mu_c(h), self.fc_log_c(h)
-        mu_t, log_t = self.fc_mu_t(h), self.fc_log_t(h)
+        # Snap spatial embeddings to nearest Codebook Tokens
+        quantized_c, vq_loss_c, perplexity_c = self.vq_c(z_c)
+        quantized_t, vq_loss_t, perplexity_t = self.vq_t(z_t)
 
-        z_c = self.reparameterize(mu_c, log_c)
-        z_t = self.reparameterize(mu_t, log_t)
+        recon_static = self.decoder(quantized_c)
+        pred_next = self.decoder(quantized_t)
 
-        recon_static = self.decode(z_c)
-        pred_next = self.decode(z_t)
-
-        return recon_static, pred_next, mu_c, log_c, mu_t, log_t
+        return recon_static, pred_next, vq_loss_c, vq_loss_t, perplexity_c, perplexity_t
 
 
 def verify_vae(model, val_loader, epoch):
@@ -258,7 +311,7 @@ def train():
     val_batch = min(BATCH_SIZE, val_size)
     val_loader = DataLoader(val_dataset, batch_size=val_batch, shuffle=False, drop_last=False)
 
-    model = SplitBrainVAE().to(DEVICE)
+    model = SpatialVQVAE().to(DEVICE)
 
     # Resume Training Logic
     start_epoch = 1
@@ -297,19 +350,14 @@ def train():
             mask = (torch.rand_like(inputs[:, 0:1, :, :]) > 0.05).float()
             noisy_inputs = noisy_inputs * mask
 
-            recon, pred, mu_c, log_c, mu_t, log_t = model(noisy_inputs)
+            recon, pred, vq_loss_c, vq_loss_t, perp_c, perp_t = model(noisy_inputs)
 
-            # L1 Loss heavily penalizes blurriness and forces sharper edges compared to MSE
+            # Perceptual Spatial loss
             loss_context = F.l1_loss(recon, current_frame)
             loss_trend = F.l1_loss(pred, targets)
 
-            kld = -0.5 * torch.sum(1 + log_c - mu_c.pow(2) - log_c.exp())
-            kld += -0.5 * torch.sum(1 + log_t - mu_t.pow(2) - log_t.exp())
-            kld /= (BATCH_SIZE * 2)
-
-            # Lower KLD to give the VAE more capacity to encode sharp, high-frequency details
-            KLD_WEIGHT = 0.000005
-            loss = loss_context + (2.0 * loss_trend) + (KLD_WEIGHT * kld)
+            # KLD is replaced natively by Vector Quantization Commitment Loss
+            loss = loss_context + (2.0 * loss_trend) + vq_loss_c + vq_loss_t
 
             optimizer.zero_grad()
             loss.backward()
@@ -327,16 +375,12 @@ def train():
                 val_inputs, val_targets = val_inputs.to(DEVICE), val_targets.to(DEVICE)
                 val_current = val_inputs[:, 3:4, :, :]
 
-                v_recon, v_pred, v_mu_c, v_log_c, v_mu_t, v_log_t = model(val_inputs)
+                v_recon, v_pred, v_vq_loss_c, v_vq_loss_t, v_perp_c, v_perp_t = model(val_inputs)
 
                 v_loss_context = F.l1_loss(v_recon, val_current)
                 v_loss_trend = F.l1_loss(v_pred, val_targets)
 
-                v_kld = -0.5 * torch.sum(1 + v_log_c - v_mu_c.pow(2) - v_log_c.exp())
-                v_kld += -0.5 * torch.sum(1 + v_log_t - v_mu_t.pow(2) - v_log_t.exp())
-                v_kld /= (val_inputs.size(0) * 2)
-
-                v_loss = v_loss_context + (2.0 * v_loss_trend) + (KLD_WEIGHT * v_kld)
+                v_loss = v_loss_context + (2.0 * v_loss_trend) + v_vq_loss_c + v_vq_loss_t
                 val_loss += v_loss.item()
 
         val_loss /= len(val_loader)

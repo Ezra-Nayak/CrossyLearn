@@ -6,12 +6,12 @@ import time
 import os
 from collections import deque
 
-from train_vision import SplitBrainVAE, setup_device, IMG_SIZE, STACK_SIZE, LATENT_DIM
+from train_vision import SpatialVQVAE, setup_device, IMG_SIZE, STACK_SIZE, LATENT_DIM
 from vision import VisionSystem
 
 # --- CONFIG ---
 WINDOW_TITLE = "Crossy Road"
-VAE_CHECKPOINT = "checkpoints/crossy_vae_best.pth"
+VAE_CHECKPOINT = "checkpoints/crossy_vae_ep500.pth"
 DISPLAY_SCALE = 5  # Scales up the 160x160 images for easier viewing
 
 
@@ -25,22 +25,19 @@ def process_frame(frame):
     return resized / 255.0
 
 
-def calculate_metrics(input_img, recon_img, mu_c, mu_t):
-    """Calculates empirical metrics to detect VAE failure states."""
-    # 1. Mean Squared Error
-    mse = np.mean((input_img - recon_img) ** 2)
+def calculate_metrics(input_img, recon_img, perp_c, perp_t):
+    """Calculates empirical metrics for VQ-VAE health."""
+    # 1. Mean Absolute Error (L1) - Better for VQ architectures
+    mae = np.mean(np.abs(input_img - recon_img))
 
-    # 2. Variance Preservation (Detects "Grey Mush" posterior collapse)
+    # 2. Variance Preservation (Are edges sharp?)
     in_var = np.var(input_img)
     recon_var = np.var(recon_img)
     var_ratio = (recon_var / (in_var + 1e-8)) * 100
 
-    # 3. Latent Activity (Are the neurons actually firing?)
-    # mu_c and mu_t are the means of the latent distributions.
-    mu_c_act = np.mean(np.abs(mu_c))
-    mu_t_act = np.mean(np.abs(mu_t))
-
-    return mse, in_var, recon_var, var_ratio, mu_c_act, mu_t_act
+    # 3. Codebook Perplexity (How many of the 512 distinct codes are actively being used?)
+    # High is good. Low (< 10) means Codebook Collapse.
+    return mae, var_ratio, perp_c, perp_t
 
 
 def main():
@@ -52,7 +49,7 @@ def main():
 
     # 1. Setup Device & Load Model
     device = setup_device()
-    vae = SplitBrainVAE().to(device)
+    vae = SpatialVQVAE().to(device)
 
     try:
         vae.load_state_dict(torch.load(VAE_CHECKPOINT, map_location=device))
@@ -94,8 +91,8 @@ def main():
 
             # --- FORWARD PASS ---
             with torch.no_grad():
-                # Reverted VAE returns 6 values: recon, pred, mu_c, log_c, mu_t, log_t
-                recon, pred, mu_c, _, mu_t, _ = vae(tensor_in)
+                # VQ-VAE returns: recon, pred, vq_loss_c, vq_loss_t, perp_c, perp_t
+                recon, pred, _, _, perp_c, perp_t = vae(tensor_in)
 
             # Extract images to CPU numpy (Convert back to 0-255 uint8)
             img_input = stack[3]  # The current reference frame
@@ -103,9 +100,9 @@ def main():
             img_pred = pred[0].cpu().numpy().squeeze()
 
             # --- CALCULATE METRICS ---
-            mse, in_var, recon_var, var_ratio, act_c, act_t = calculate_metrics(
+            mae, var_ratio, perp_c_val, perp_t_val = calculate_metrics(
                 img_input, img_recon,
-                mu_c.cpu().numpy(), mu_t.cpu().numpy()
+                perp_c.item(), perp_t.item()
             )
 
             # --- VISUALIZATION HUD ---
@@ -145,9 +142,9 @@ def main():
 
                 # ANSI Escape codes to clear the line and print fresh
                 print(f"\r[FPS: {fps:.1f}] "
-                      f"MSE: {mse:.4f} | "
+                      f"MAE: {mae:.4f} | "
                       f"VarPreserve: {var_ratio:>5.1f}% | "
-                      f"Latent Firing: (Ctx:{act_c:.3f}, Trnd:{act_t:.3f})    ", end="")
+                      f"Codebook Usage/512 (Ctx:{perp_c_val:.1f}, Trnd:{perp_t_val:.1f})    ", end="")
 
                 start_time = time.time()
 

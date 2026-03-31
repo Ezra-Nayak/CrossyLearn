@@ -24,7 +24,8 @@ class AlgorithmicExpert:
         self.TERRAIN_MANAGER_BASE = 0x00000000
         self.entity_vault_addr = None
         self.entity_history = {}
-        self.known_terrain = {}  # SOTA: Persistent memory prevents "Empty River" traps
+        self.known_terrain = {}  # Persistent terrain classification
+        self.lilypad_memory = {}  # Persistent grid memory for lilypads: {rounded_z: (x, width)}
         if self.pm:
             self.inject_entity_tracker()
 
@@ -88,131 +89,130 @@ class AlgorithmicExpert:
 
     def poll_world_state(self, player_x, player_z):
         if not self.pm or not self.entity_vault_addr:
-            return {},[]
+            return {}, []
 
         try:
             vault_data = self.pm.read_bytes(self.entity_vault_addr, 16384)
             self.pm.write_bytes(self.entity_vault_addr, b'\x00' * 16384, 16384)
 
             current_time = time.time()
-            entities =[]
-            terrain_votes = {}
+            entities = []
+            terrain_map = {}
 
             for i in range(1024):
                 offset = i * 16
                 ptr, x, y, z = struct.unpack_from("<Ifff", vault_data, offset)
 
                 if ptr != 0:
-                    distance_to_player = ((x - player_x) ** 2 + (z - player_z) ** 2) ** 0.5
-                    if distance_to_player < 0.5:
+                    vx, vz = 0.0, 0.0
+
+                    hist = self.entity_history.get(ptr, None)
+                    # Length 6: (lx, ly, lz, lt, last_vx, last_vz)
+                    if hist and len(hist) == 6:
+                        lx, ly, lz, lt, prev_vx, prev_vz = hist
+                        dt = current_time - lt
+
+                        # Wait at least 19ms (Engine Tick 16.6ms + margin) to calculate derivative
+                        # This PREVENTS the "Velocity Jitter" caused by fast Python loops!
+                        if dt >= 0.019:
+                            raw_vx = (x - lx) / dt
+                            raw_vz = (z - lz) / dt
+
+                            # Ignore teleportations (map looping)
+                            if abs(raw_vx) > 30.0: raw_vx = prev_vx
+
+                            # Smooth the velocity using a Moving Average
+                            vx = (prev_vx * 0.5) + (raw_vx * 0.5)
+                            vz = (prev_vz * 0.5) + (raw_vz * 0.5)
+
+                            self.entity_history[ptr] = (x, y, z, current_time, vx, vz)
+                        else:
+                            # Not enough time passed. Keep accumulating dt, keep old velocity.
+                            vx, vz = prev_vx, prev_vz
+                    else:
+                        # First time seeing entity
+                        self.entity_history[ptr] = (x, y, z, current_time, 0.0, 0.0)
+
+                    try:
+                        bounds_data = self.pm.read_bytes(ptr + 0x0C, 12)
+                        w, h, d = struct.unpack("<fff", bounds_data)
+                    except Exception:
                         continue
 
-                    speed = 0.0
-                    delta_x = 0.0
-                    if ptr in self.entity_history:
-                        last_x, last_time = self.entity_history[ptr]
-                        dt = current_time - last_time
-                        if dt > 0.001:
-                            raw_speed = (x - last_x) / dt
-                            # SOTA: Increased to 50.0 so high-speed Trains aren't ignored
-                            if abs(raw_speed) < 50.0:
-                                speed = raw_speed
-                                delta_x = abs(x - last_x)
-
-                    self.entity_history[ptr] = (x, current_time)
-                    is_moving = delta_x > 0.01
+                    # Ignore the Player
+                    if abs(x - player_x) < 0.5 and abs(z - player_z) < 0.5 and h < 0.5:
+                        continue
 
                     ent_type = "UNKNOWN"
-                    if is_moving:
-                        if y < 0.5:
-                            ent_type = "LOG"
-                        else:
-                            ent_type = "CAR"
-                    else:
-                        if y < 0.3:
-                            ent_type = "LILYPAD"
-                        else:
-                            if abs(y - 1.19) < 0.1:
-                                continue
-                            ent_type = "OBSTACLE"
-
+                    is_moving = abs(vx) > 0.5 or abs(vz) > 0.5
                     rz = round(z)
-                    if rz not in terrain_votes:
-                        terrain_votes[rz] = {'ROAD': 0, 'GRASS': 0, 'RIVER': 0, 'LILYPADS': 0, 'OBSTACLES': 0}
 
-                    if ent_type == "CAR":
-                        terrain_votes[rz]['ROAD'] += 1
-                    elif ent_type == "LOG":
-                        terrain_votes[rz]['RIVER'] += 1
-                    elif ent_type == "LILYPAD":
-                        terrain_votes[rz]['LILYPADS'] += 1
-                        terrain_votes[rz]['RIVER'] += 1
-                    elif ent_type == "OBSTACLE":
-                        terrain_votes[rz]['OBSTACLES'] += 1
-                        terrain_votes[rz]['GRASS'] += 1
-
-                    width = 3.5 if abs(speed) > 8.0 else 1.8
-                    if ent_type == "LILYPAD": width = 1.2
-                    if ent_type == "OBSTACLE": width = 0.8
+                    if w > 10.0:
+                        continue
+                    elif h < 0.12 and w < 1.0:
+                        # ACTUAL LILYPAD: Height ~0.062.
+                        ent_type = "LILYPAD"
+                        terrain_map[rz] = "RIVER"
+                        self.lilypad_memory[rz] = (x, w)
+                    elif h < 0.4 and is_moving:
+                        ent_type = "LOG"
+                        terrain_map[rz] = "RIVER"
+                    elif h >= 0.4 and is_moving:
+                        ent_type = "CAR"
+                        terrain_map[rz] = "ROAD"
+                    elif h >= 0.15 and not is_moving and w < 2.0:
+                        # OBSTACLE: Heights 0.188 to 0.250+.
+                        ent_type = "OBSTACLE"
+                        terrain_map[rz] = "GRASS"
+                    else:
+                        continue  # Exclude non-physical particles
 
                     entities.append({
-                        'x': x, 'y': y, 'z': z, 'type': ent_type, 'speed': speed, 'width': width
+                        'ptr': ptr, 'x': x, 'y': y, 'z': z,
+                        'vx': vx, 'vz': vz, 'w': w, 'h': h, 'd': d,
+                        'type': ent_type
                     })
 
-            stale_keys =[k for k, v in self.entity_history.items() if current_time - v[1] > 0.5]
+            stale_keys = [k for k, v in self.entity_history.items() if current_time - v[3] > 0.5]
             for k in stale_keys: del self.entity_history[k]
 
-            terrain_map = {}
-            for tz in range(int(player_z) - 5, int(player_z) + 30):
-                votes = terrain_votes.get(tz, {'ROAD': 0, 'GRASS': 0, 'RIVER': 0, 'LILYPADS': 0, 'OBSTACLES': 0})
+            # Cleanup lilypad memory for stale rows to prevent memory bloat
+            stale_lilypads = [k for k in self.lilypad_memory.keys() if k < (player_z - 5) or k > (player_z + 35)]
+            for k in stale_lilypads: del self.lilypad_memory[k]
 
-                if votes['LILYPADS'] > 0 and votes['OBSTACLES'] > 0:
-                    votes['RIVER'] -= votes['LILYPADS']
-
-                current_vote = "EMPTY"
-                if votes['RIVER'] > 0: current_vote = "RIVER"
-                elif votes['ROAD'] > 0: current_vote = "ROAD"
-                elif votes['GRASS'] > 0: current_vote = "GRASS"
-
-                # SOTA: Persistent Mapping. Once a river, always a river.
-                if tz not in self.known_terrain:
-                    self.known_terrain[tz] = current_vote
-                else:
-                    if current_vote in ["RIVER", "ROAD"]:
-                        self.known_terrain[tz] = current_vote
-                    elif current_vote == "GRASS" and self.known_terrain[tz] == "EMPTY":
-                        self.known_terrain[tz] = "GRASS"
-
-                terrain_map[tz] = self.known_terrain[tz]
+            min_z = int(player_z) - 5
+            max_z = int(player_z) + 30
+            for tz in range(min_z, max_z):
+                if tz not in terrain_map:
+                    terrain_map[tz] = "GRASS"
 
             return terrain_map, entities
 
         except Exception:
-            return {},[]
+            return {}, []
 
     def calculate_perfect_action(self, player_x, player_z, action_mask, terrain_map, entities):
         """
-        SOTA Algorithmic Pathfinding via Spatio-Temporal Lookahead.
-        Simulates parallel timelines using BFS to find the path that maximizes forward
-        progress while guaranteeing survival against dynamic hitboxes.
+        100% ENGINE-ACCURATE Pathfinding using 2D Continuous Collision Detection (CCD).
+        Calculates interpolations during jump air-time to prevent tail clipping.
         """
         import collections
 
-        # --- TUNABLE PARAMETERS ---
-        MAX_DEPTH = 6  # How many moves to look ahead (Depth 6 = ~1.5 seconds)
-        DT = 0.25  # Time duration per action/jump in seconds
-        PLAYER_WIDTH = 0.6  # Forgiving player hitbox
-        BOUND_LEFT = -4.5  # Leftmost screen boundary
-        BOUND_RIGHT = 4.5  # Rightmost screen boundary
+        MAX_DEPTH = 8
+        INPUT_LATENCY = 0.3  # Time for keystroke + game engine to initiate jump
+        DT = 0.18  # Air-time of the jump
 
-        # Action mappings
+        # Hitboxes based on analyzed Engine Ground Truth
+        PLAYER_WIDTH = 1
+        PLAYER_DEPTH = 0.6
+        COLLISION_BUFFER_X = 0.032  # Displacement per tick buffer from Ground Truth report
+        BOUND_LEFT = -4.5
+        BOUND_RIGHT = 4.5
+
         ACTIONS = [ACTION_UP, ACTION_LEFT, ACTION_RIGHT, ACTION_IDLE]
-
-        # State queue: (current_x, current_z, elapsed_time, action_history)
         queue = collections.deque([(player_x, player_z, 0.0, [])])
         visited = set()
 
-        # Track best outcomes
         best_score = -float('inf')
         best_first_action = ACTION_IDLE
         longest_survival_depth = -1
@@ -221,11 +221,8 @@ class AlgorithmicExpert:
             x, z, t, path = queue.popleft()
             depth = len(path)
 
-            # --- SCORE EVALUATION ---
-            # Prioritize moving forward (Z), penalize deviating far from center (X)
             score = (z - player_z) * 10 - abs(x) * 0.5
 
-            # Update the global best action if this path survives longer or reaches a higher score
             if depth > longest_survival_depth:
                 longest_survival_depth = depth
                 best_score = score
@@ -236,15 +233,23 @@ class AlgorithmicExpert:
                     if path: best_first_action = path[0]
 
             if depth == MAX_DEPTH:
-                continue  # Reached lookahead horizon
+                continue
 
-            # --- EXPLORE BRANCHES ---
+            is_standing_on_lilypad = False
+            rz_current = round(z)
+            if rz_current in self.lilypad_memory:
+                lx, lw = self.lilypad_memory[rz_current]
+                if abs(x - lx) < (lw / 2.0 + 0.1):
+                    is_standing_on_lilypad = True
+
             for action in ACTIONS:
-                # 1. Obey hard logic constraints for immediate next moves (e.g., blocked by trees)
+                # User Tweak: Only allow UP (or IDLE) when on a lilypad
+                if is_standing_on_lilypad and action in [ACTION_LEFT, ACTION_RIGHT]:
+                    continue
+
                 if depth == 0 and action_mask[action] < -1.0:
                     continue
 
-                # 2. Calculate intended positional shift
                 nx, nz = x, z
                 if action == ACTION_UP:
                     nz += 1
@@ -253,61 +258,69 @@ class AlgorithmicExpert:
                 elif action == ACTION_RIGHT:
                     nx += 1
 
-                # Prevent walking off the map edge
                 if nx < BOUND_LEFT or nx > BOUND_RIGHT:
                     continue
 
                 nt = t + DT
                 tz = round(nz)
-                terrain = terrain_map.get(tz, "GRASS")  # Assume Grass if unknown
+                terrain = terrain_map.get(tz, "GRASS")
 
-                # Extract entities that exist in the target lane
-                row_ents = [e for e in entities if abs(round(e['z']) - tz) < 0.5]
+                # SOTA: Grab entities in the CURRENT lane and TARGET lane to check for jump overlaps
+                local_ents = [e for e in entities if abs(e['z'] - z) < 1.0 or abs(e['z'] - nz) < 1.0]
 
                 is_safe = True
                 drifted_x = nx
                 on_platform = False
 
-                # --- 3. SPATIO-TEMPORAL COLLISION DETECTION ---
-                if terrain == "ROAD":
-                    # Sub-stepping prevents fast entities (like Trains) from teleporting through the player
-                    steps = 3
-                    for i in range(1, steps + 1):
-                        sub_t = t + DT * (i / steps)
-                        for e in row_ents:
-                            if e['type'] == 'CAR':
-                                ext_x = e['x'] + (e['speed'] * sub_t)
-                                if abs(ext_x - nx) < (e['width'] / 2.0 + PLAYER_WIDTH / 2.0):
-                                    is_safe = False
-                                    break
-                        if not is_safe: break
+                # 1. Continuous Swept Collision (Checking mid-air overlaps)
+                steps = 4
+                for i in range(1, steps + 1):
+                    fraction = i / float(steps)
 
-                elif terrain == "RIVER":
-                    # Must land on a log/lilypad at time `nt`
-                    for e in row_ents:
-                        if e['type'] in ['LOG', 'LILYPAD']:
-                            ext_x = e['x'] + (e['speed'] * nt)
-                            if abs(ext_x - nx) < (e['width'] / 2.0):
-                                on_platform = True
-                                # Calculate river drift for future steps
-                                drifted_x += e['speed'] * DT
-                                break
+                    # SOTA FIX: Shift the timeline forward by the input latency!
+                    # The jump doesn't start at `t`. It starts at `t + INPUT_LATENCY`.
+                    sub_t = t + INPUT_LATENCY + (DT * fraction)
 
-                    # If we jumped into the river and missed a platform, or drifted off-screen
-                    if not on_platform or drifted_x < BOUND_LEFT or drifted_x > BOUND_RIGHT:
-                        is_safe = False
+                    # Interpolated chicken position mid-jump
+                    cur_x = x + (nx - x) * fraction
+                    cur_z = z + (nz - z) * fraction
 
-                else:  # GRASS / OBSTACLES
-                    for e in row_ents:
-                        if e['type'] == 'OBSTACLE':
-                            # Static hitboxes
-                            if abs(e['x'] - nx) < (e['width'] / 2.0 + PLAYER_WIDTH / 2.0):
+                    for e in local_ents:
+                        if e['type'] in ['CAR', 'OBSTACLE']:
+                            ext_x = e['x'] + (e['vx'] * sub_t)
+                            ext_z = e['z']
+
+                            dx = abs(cur_x - ext_x)
+                            dz = abs(cur_z - ext_z)
+
+                            # Engine-verified safety buffer (accounts for 16.6ms update aliasing)
+                            safety_buffer_x = COLLISION_BUFFER_X if e['type'] == 'CAR' else 0.05
+
+                            # True AABB Overlap check using Ground Truth constants
+                            if dx < (e['w'] / 2.0 + PLAYER_WIDTH / 2.0 + safety_buffer_x) and \
+                                    dz < (e['d'] / 2.0 + PLAYER_DEPTH / 2.0):
                                 is_safe = False
                                 break
+                    if not is_safe:
+                        break
 
-                # --- 4. QUEUE VALID FUTURES ---
-                if is_safe:
-                    # Discretize X slightly to prevent state-space explosion due to floating point drift
+                # 2. End of Jump Destination Check (River Log Landing)
+                if is_safe and terrain == "RIVER":
+                    # For rivers, we must verify we land on a platform at the END of the jump
+                    time_of_landing = t + INPUT_LATENCY + DT
+                    for e in local_ents:
+                        if e['type'] in ['LOG', 'LILYPAD'] and abs(e['z'] - nz) < 0.5:
+                            ext_x_end = e['x'] + (e['vx'] * time_of_landing)
+
+                            # Platform landing grace
+                            if abs(ext_x_end - nx) < (e['w'] / 2.0 - 0.1):
+                                on_platform = True
+                                drifted_x += e['vx'] * DT  # Drift while mid-air
+                                break
+                    if not on_platform:
+                        is_safe = False
+
+                if is_safe and BOUND_LEFT <= drifted_x <= BOUND_RIGHT:
                     state_key = (round(drifted_x * 2) / 2.0, round(nz), depth + 1)
                     if state_key not in visited:
                         visited.add(state_key)

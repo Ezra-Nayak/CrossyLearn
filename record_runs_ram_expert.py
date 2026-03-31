@@ -106,32 +106,23 @@ class AlgorithmicExpert:
                 if ptr != 0:
                     vx, vz = 0.0, 0.0
 
-                    hist = self.entity_history.get(ptr, None)
-                    # Length 6: (lx, ly, lz, lt, last_vx, last_vz)
-                    if hist and len(hist) == 6:
-                        lx, ly, lz, lt, prev_vx, prev_vz = hist
-                        dt = current_time - lt
+                    # Sliding time window for velocity to eliminate async jitter
+                    hist = self.entity_history.get(ptr, [])
+                    if isinstance(hist, tuple): hist = []  # Defensive type check
+                    hist.append((x, z, current_time))
+                    if len(hist) > 10:
+                        hist.pop(0)
+                    self.entity_history[ptr] = hist
 
-                        # Wait at least 19ms (Engine Tick 16.6ms + margin) to calculate derivative
-                        # This PREVENTS the "Velocity Jitter" caused by fast Python loops!
-                        if dt >= 0.019:
-                            raw_vx = (x - lx) / dt
-                            raw_vz = (z - lz) / dt
-
-                            # Ignore teleportations (map looping)
-                            if abs(raw_vx) > 30.0: raw_vx = prev_vx
-
-                            # Smooth the velocity using a Moving Average
-                            vx = (prev_vx * 0.5) + (raw_vx * 0.5)
-                            vz = (prev_vz * 0.5) + (raw_vz * 0.5)
-
-                            self.entity_history[ptr] = (x, y, z, current_time, vx, vz)
-                        else:
-                            # Not enough time passed. Keep accumulating dt, keep old velocity.
-                            vx, vz = prev_vx, prev_vz
-                    else:
-                        # First time seeing entity
-                        self.entity_history[ptr] = (x, y, z, current_time, 0.0, 0.0)
+                    vx, vz = 0.0, 0.0
+                    if len(hist) >= 3:
+                        oldest_x, oldest_z, oldest_t = hist[0]
+                        dt = current_time - oldest_t
+                        if dt > 0.05:
+                            vx = (x - oldest_x) / dt
+                            vz = (z - oldest_z) / dt
+                            if abs(vx) > 30.0: vx = 0.0
+                            if abs(vz) > 30.0: vz = 0.0
 
                     try:
                         bounds_data = self.pm.read_bytes(ptr + 0x0C, 12)
@@ -173,7 +164,7 @@ class AlgorithmicExpert:
                         'type': ent_type
                     })
 
-            stale_keys = [k for k, v in self.entity_history.items() if current_time - v[3] > 0.5]
+            stale_keys = [k for k, v in self.entity_history.items() if (current_time - v[-1][2]) > 0.5]
             for k in stale_keys: del self.entity_history[k]
 
             # Cleanup lilypad memory for stale rows to prevent memory bloat
@@ -188,8 +179,32 @@ class AlgorithmicExpert:
 
             return terrain_map, entities
 
-        except Exception:
+
+        except Exception as e:
+            print(f"[POLL ERROR] {e}")
             return {}, []
+
+    @staticmethod
+    def _check_temporal_overlap(car_x, car_v, car_w, player_x, player_w, t_start, t_end):
+        """
+        100% Mathematically exact Continuous Collision Detection in 1D Time Space.
+        Calculates the exact time interval a moving object occupies the player's X space.
+        """
+        eff_w = (car_w / 2.0) + (player_w / 2.0)
+        dist = player_x - car_x
+
+        if abs(car_v) < 0.01:
+            return abs(dist) < eff_w
+
+        if car_v > 0:
+            t_in = (dist - eff_w) / car_v
+            t_out = (dist + eff_w) / car_v
+        else:
+            t_in = (dist + eff_w) / car_v
+            t_out = (dist - eff_w) / car_v
+
+        # Check if the danger interval [t_in, t_out] overlaps with presence[t_start, t_end]
+        return t_in < t_end and t_out > t_start
 
     def calculate_perfect_action(self, player_x, player_z, action_mask, terrain_map, entities):
         """
@@ -198,41 +213,40 @@ class AlgorithmicExpert:
         """
         import collections
 
-        MAX_DEPTH = 8
-        INPUT_LATENCY = 0.3  # Time for keystroke + game engine to initiate jump
-        DT = 0.18  # Air-time of the jump
+        MAX_DEPTH = 5
+        DT = 0.2
 
-        # Hitboxes based on analyzed Engine Ground Truth
-        PLAYER_WIDTH = 1
-        PLAYER_DEPTH = 0.6
-        COLLISION_BUFFER_X = 0.032  # Displacement per tick buffer from Ground Truth report
         BOUND_LEFT = -4.5
         BOUND_RIGHT = 4.5
-
         ACTIONS = [ACTION_UP, ACTION_LEFT, ACTION_RIGHT, ACTION_IDLE]
+
         queue = collections.deque([(player_x, player_z, 0.0, [])])
         visited = set()
 
         best_score = -float('inf')
         best_first_action = ACTION_IDLE
-        longest_survival_depth = -1
+        longest_survival_depth = 0
 
         while queue:
             x, z, t, path = queue.popleft()
             depth = len(path)
 
-            score = (z - player_z) * 10 - abs(x) * 0.5
+            # CURES STALE WAITING: Subtract time to force the bot to pick the FASTEST route
+            score = (z - player_z) * 10 - abs(x) * 0.5 - (t * 2.0)
 
             if depth > longest_survival_depth:
                 longest_survival_depth = depth
                 best_score = score
-                if path: best_first_action = path[0]
-            elif depth == longest_survival_depth:
+                if path:
+                    best_first_action = path[0]
+                else:
+                    best_first_action = ACTION_IDLE
+            elif depth == longest_survival_depth and depth > 0:
                 if score > best_score:
                     best_score = score
-                    if path: best_first_action = path[0]
+                    best_first_action = path[0]
 
-            if depth == MAX_DEPTH:
+            if depth >= MAX_DEPTH:
                 continue
 
             is_standing_on_lilypad = False
@@ -242,11 +256,19 @@ class AlgorithmicExpert:
                 if abs(x - lx) < (lw / 2.0 + 0.1):
                     is_standing_on_lilypad = True
 
+            # Calculate if we are standing on a moving platform (Log/Lilypad) to accurately calculate drift
+            current_vx = 0.0
+            if terrain_map.get(rz_current, "GRASS") == "RIVER":
+                for e in entities:
+                    if e['type'] in ['LOG', 'LILYPAD'] and abs(e['z'] - z) < 0.5:
+                        log_x_at_t = e['x'] + (e['vx'] * t)
+                        if abs(log_x_at_t - x) < (e['w'] / 2.0 + 0.1):
+                            current_vx = e['vx']
+                            break
+
             for action in ACTIONS:
-                # User Tweak: Only allow UP (or IDLE) when on a lilypad
                 if is_standing_on_lilypad and action in [ACTION_LEFT, ACTION_RIGHT]:
                     continue
-
                 if depth == 0 and action_mask[action] < -1.0:
                     continue
 
@@ -258,73 +280,83 @@ class AlgorithmicExpert:
                 elif action == ACTION_RIGHT:
                     nx += 1
 
-                if nx < BOUND_LEFT or nx > BOUND_RIGHT:
+                # SOTA KINEMATICS: Accurately model drifting on logs during Wait vs Air-Time
+                if action == ACTION_IDLE:
+                    nt = t + 0.20
+                    x_land = x + (current_vx * 0.20)
+                else:
+                    nt = t + DT
+                    x_launch = x + current_vx  # We drift while waiting to jump!
+                    x_land = x_launch
+                    if action == ACTION_LEFT:
+                        x_land -= 1.0
+                    elif action == ACTION_RIGHT:
+                        x_land += 1.0
+
+                if x_land < BOUND_LEFT or x_land > BOUND_RIGHT:
                     continue
 
-                nt = t + DT
                 tz = round(nz)
                 terrain = terrain_map.get(tz, "GRASS")
-
-                # SOTA: Grab entities in the CURRENT lane and TARGET lane to check for jump overlaps
-                local_ents = [e for e in entities if abs(e['z'] - z) < 1.0 or abs(e['z'] - nz) < 1.0]
+                local_ents = [e for e in entities if abs(e['z'] - z) < 0.5 or abs(e['z'] - nz) < 0.5]
 
                 is_safe = True
-                drifted_x = nx
                 on_platform = False
 
-                # 1. Continuous Swept Collision (Checking mid-air overlaps)
-                steps = 4
-                for i in range(1, steps + 1):
-                    fraction = i / float(steps)
-
-                    # SOTA FIX: Shift the timeline forward by the input latency!
-                    # The jump doesn't start at `t`. It starts at `t + INPUT_LATENCY`.
-                    sub_t = t + INPUT_LATENCY + (DT * fraction)
-
-                    # Interpolated chicken position mid-jump
-                    cur_x = x + (nx - x) * fraction
-                    cur_z = z + (nz - z) * fraction
+                # 1. mathematically perfect 1D Temporal Sweeping (Shadow Casting)
+                if action == ACTION_IDLE:
+                    t_start = t
+                    t_end = t + 0.25
 
                     for e in local_ents:
-                        if e['type'] in ['CAR', 'OBSTACLE']:
-                            ext_x = e['x'] + (e['vx'] * sub_t)
-                            ext_z = e['z']
-
-                            dx = abs(cur_x - ext_x)
-                            dz = abs(cur_z - ext_z)
-
-                            # Engine-verified safety buffer (accounts for 16.6ms update aliasing)
-                            safety_buffer_x = COLLISION_BUFFER_X if e['type'] == 'CAR' else 0.05
-
-                            # True AABB Overlap check using Ground Truth constants
-                            if dx < (e['w'] / 2.0 + PLAYER_WIDTH / 2.0 + safety_buffer_x) and \
-                                    dz < (e['d'] / 2.0 + PLAYER_DEPTH / 2.0):
+                        if e['type'] in ['CAR', 'OBSTACLE'] and abs(e['z'] - z) < 0.5:
+                            speed_pad = abs(e['vx']) * 0.05
+                            eff_w = e['w'] + (0.8 + speed_pad if e['type'] == 'CAR' else 0.2)
+                            if AlgorithmicExpert._check_temporal_overlap(e['x'], e['vx'], eff_w, x_land, 0.8, t_start,
+                                                                         t_end):
                                 is_safe = False
                                 break
-                    if not is_safe:
-                        break
+                else:
+                    t_wait_start = t
+                    t_air_mid = t + (DT / 2.0)
+                    t_grace_end = nt + 0.15
+
+                    for e in local_ents:
+                        if e['type'] not in ['CAR', 'OBSTACLE']: continue
+
+                        speed_pad = abs(e['vx']) * 0.05
+                        eff_w = e['w'] + (0.8 + speed_pad if e['type'] == 'CAR' else 0.2)
+
+                        if abs(e['z'] - z) < 0.5:
+                            if AlgorithmicExpert._check_temporal_overlap(e['x'], e['vx'], eff_w, x, 0.8, t_wait_start,
+                                                                         t_air_mid):
+                                is_safe = False
+                                break
+
+                        if abs(e['z'] - nz) < 0.5 and is_safe:
+                            if AlgorithmicExpert._check_temporal_overlap(e['x'], e['vx'], eff_w, x_land, 0.8, t_air_mid,
+                                                                         t_grace_end):
+                                is_safe = False
+                                break
 
                 # 2. End of Jump Destination Check (River Log Landing)
                 if is_safe and terrain == "RIVER":
-                    # For rivers, we must verify we land on a platform at the END of the jump
-                    time_of_landing = t + INPUT_LATENCY + DT
                     for e in local_ents:
                         if e['type'] in ['LOG', 'LILYPAD'] and abs(e['z'] - nz) < 0.5:
-                            ext_x_end = e['x'] + (e['vx'] * time_of_landing)
-
-                            # Platform landing grace
-                            if abs(ext_x_end - nx) < (e['w'] / 2.0 - 0.1):
+                            log_x_at_nt = e['x'] + (e['vx'] * nt)
+                            # CURES LOG SUICIDE: Compare final landing position vs final log position
+                            if abs(log_x_at_nt - x_land) < (e['w'] / 2.0 - 0.15):
                                 on_platform = True
-                                drifted_x += e['vx'] * DT  # Drift while mid-air
                                 break
                     if not on_platform:
                         is_safe = False
 
-                if is_safe and BOUND_LEFT <= drifted_x <= BOUND_RIGHT:
-                    state_key = (round(drifted_x * 2) / 2.0, round(nz), depth + 1)
+                if is_safe:
+                    # CURES STALE PATH PRUNING: Quantize Time in state key so identical locations at different times are verified!
+                    state_key = (round(x_land * 2) / 2.0, round(nz), round(nt * 5))
                     if state_key not in visited:
                         visited.add(state_key)
-                        queue.append((drifted_x, nz, nt, path + [action]))
+                        queue.append((x_land, nz, nt, path + [action]))
 
         return best_first_action
 

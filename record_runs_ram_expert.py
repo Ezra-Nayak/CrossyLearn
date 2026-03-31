@@ -98,15 +98,15 @@ class AlgorithmicExpert:
             current_time = time.time()
             entities = []
             terrain_map = {}
+            solid_lanes = set()
 
+            # 1. Scan the vault for all current entities
             for i in range(1024):
                 offset = i * 16
                 ptr, x, y, z = struct.unpack_from("<Ifff", vault_data, offset)
 
                 if ptr != 0:
-                    vx, vz = 0.0, 0.0
-
-                    # Sliding time window for velocity to eliminate async jitter
+                    # Update Velocity History
                     hist = self.entity_history.get(ptr, [])
                     if isinstance(hist, tuple): hist = []  # Defensive type check
                     hist.append((x, z, current_time))
@@ -121,8 +121,7 @@ class AlgorithmicExpert:
                         if dt > 0.05:
                             vx = (x - oldest_x) / dt
                             vz = (z - oldest_z) / dt
-                            if abs(vx) > 30.0: vx = 0.0
-                            if abs(vz) > 30.0: vz = 0.0
+                            if abs(vx) > 30.0: vx, vz = 0.0, 0.0
 
                     try:
                         bounds_data = self.pm.read_bytes(ptr + 0x0C, 12)
@@ -130,18 +129,28 @@ class AlgorithmicExpert:
                     except Exception:
                         continue
 
+                    rz = round(z)
+                    is_moving = abs(vx) > 0.5 or abs(vz) > 0.5
+
+                    # ENGINE PHYSICS TERRAIN DETECTOR:
+                    # Solid ground lanes have static physical colliders spanning the map.
+                    if w >= 12.0 and not is_moving:
+                        if h >= 0.1 and y > -0.5:
+                            solid_lanes.add(rz)
+                        continue
+
                     # Ignore the Player
                     if abs(x - player_x) < 0.5 and abs(z - player_z) < 0.5 and h < 0.5:
                         continue
 
-                    ent_type = "UNKNOWN"
-                    is_moving = abs(vx) > 0.5 or abs(vz) > 0.5
-                    rz = round(z)
+                    # Ignore invisible or under-map pooled objects
+                    if y < -1.0 or w < 0.05 or h < 0.01:
+                        continue
 
+                    ent_type = "UNKNOWN"
                     if w > 10.0:
                         continue
                     elif h < 0.12 and w < 1.0:
-                        # ACTUAL LILYPAD: Height ~0.062.
                         ent_type = "LILYPAD"
                         terrain_map[rz] = "RIVER"
                         self.lilypad_memory[rz] = (x, w)
@@ -152,11 +161,10 @@ class AlgorithmicExpert:
                         ent_type = "CAR"
                         terrain_map[rz] = "ROAD"
                     elif h >= 0.15 and not is_moving and w < 2.0:
-                        # OBSTACLE: Heights 0.188 to 0.250+.
                         ent_type = "OBSTACLE"
                         terrain_map[rz] = "GRASS"
                     else:
-                        continue  # Exclude non-physical particles
+                        continue
 
                     entities.append({
                         'ptr': ptr, 'x': x, 'y': y, 'z': z,
@@ -164,21 +172,33 @@ class AlgorithmicExpert:
                         'type': ent_type
                     })
 
+            # 2. POST-SCAN PROCESSING (Outside the 1024 loop)
+            # Fix Terrain Map: If a lane is physically solid, it CANNOT be a River.
+            for tz in solid_lanes:
+                if terrain_map.get(tz) == "RIVER":
+                    terrain_map[tz] = "GRASS"
+                    if tz in self.lilypad_memory:
+                        del self.lilypad_memory[tz]
+
+            # Purge fake lilypads from the entities list
+            entities = [e for e in entities if not (e['type'] == 'LILYPAD' and round(e['z']) in solid_lanes)]
+
+            # 3. Cleanup Stale Data
             stale_keys = [k for k, v in self.entity_history.items() if (current_time - v[-1][2]) > 0.5]
-            for k in stale_keys: del self.entity_history[k]
+            for k in stale_keys:
+                del self.entity_history[k]
 
-            # Cleanup lilypad memory for stale rows to prevent memory bloat
             stale_lilypads = [k for k in self.lilypad_memory.keys() if k < (player_z - 5) or k > (player_z + 35)]
-            for k in stale_lilypads: del self.lilypad_memory[k]
+            for k in stale_lilypads:
+                del self.lilypad_memory[k]
 
-            min_z = int(player_z) - 5
-            max_z = int(player_z) + 30
+            # 4. Fill Grid Gaps
+            min_z, max_z = int(player_z) - 5, int(player_z) + 30
             for tz in range(min_z, max_z):
                 if tz not in terrain_map:
                     terrain_map[tz] = "GRASS"
 
             return terrain_map, entities
-
 
         except Exception as e:
             print(f"[POLL ERROR] {e}")
@@ -286,7 +306,7 @@ class AlgorithmicExpert:
                     x_land = x + (current_vx * 0.20)
                 else:
                     nt = t + DT
-                    x_launch = x + current_vx  # We drift while waiting to jump!
+                    x_launch = x  # We drift while waiting to jump!
                     x_land = x_launch
                     if action == ACTION_LEFT:
                         x_land -= 1.0

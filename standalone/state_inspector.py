@@ -43,47 +43,53 @@ def main():
             retry_visible = data['retry_visible']  # Still available as backup
             score = data['score']
 
-            # --- Determine State ---
-            # The Agent logic relies purely on pause_visible
-            new_state = "PLAYING" if pause_visible else "DEAD/MENU"
+            raw_state = ram_tracker.get_game_state()
+
+            # --- Determine State (Now prioritizing RAM!) ---
+            if raw_state is not None:
+                is_alive = (raw_state == 1)
+                new_state = "PLAYING" if is_alive else "DEAD/MENU"
+            else:
+                new_state = "PLAYING" if pause_visible else "DEAD/MENU"
 
             if new_state != current_state:
-                print(f"[{time.strftime('%H:%M:%S')}] State Change: {current_state} -> {new_state}")
+                print(
+                    f"[{time.strftime('%H:%M:%S')}] State Change: {current_state} -> {new_state} (RAM Flag: {raw_state})")
                 current_state = new_state
 
             # --- Draw Inspector HUD ---
-            # Opaque background
-            cv2.rectangle(display, (0, 0), (450, 220), (0, 0, 0), -1)
+            # Opaque background (Expanded for new data)
+            cv2.rectangle(display, (0, 0), (450, 250), (0, 0, 0), -1)
 
-            # 1. State
+            # 1. Logic State
             color = (0, 255, 0) if current_state == "PLAYING" else (0, 0, 255)
             cv2.putText(display, f"STATE: {current_state}", (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 2)
 
-            # 2. Pause Button Signal (Fast)
-            p_color = (0, 255, 0) if pause_visible else (0, 0, 255)
-            cv2.putText(display, f"Pause Visible: {pause_visible}", (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.7, p_color, 2)
+            # 2. RAM Flag (Event Driven)
+            ram_color = (0, 255, 0) if raw_state == 1 else (0, 0, 255)
+            ram_txt = f"RAM Flag: {raw_state}" if raw_state is not None else "RAM Flag: NULL"
+            cv2.putText(display, ram_txt, (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.7, ram_color, 2)
 
-            # 3. Retry Button Signal (Slow)
+            # 3. Vision Backup Signals
+            p_color = (0, 255, 0) if pause_visible else (0, 0, 255)
+            cv2.putText(display, f"Vis Pause: {pause_visible}", (220, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.7, p_color, 2)
+
             r_color = (0, 255, 0) if retry_visible else (100, 100, 100)
-            cv2.putText(display, f"Retry Visible: {retry_visible}", (10, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.7, r_color,
-                        2)
+            cv2.putText(display, f"Vis Retry: {retry_visible}", (220, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.7, r_color, 2)
 
             # 4. RAM Tracker Coordinates & Z-Score
             coords = ram_tracker.get_coords()
             if coords:
                 raw_x, raw_y, raw_z = coords
-                # Crossy Road's grid is exactly 1.0 unit per tile
                 grid_x = round(raw_x)
                 grid_z = round(raw_z)
 
-                ram_text = f"RAM Pos: X:{grid_x} | Z:{grid_z}"
-                cv2.putText(display, ram_text, (10, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2)
-
-                # Show raw jump height just to verify the hook is reading continuous memory
+                cv2.putText(display, f"RAM Pos: X:{grid_x} | Z:{grid_z}", (10, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.8,
+                            (255, 255, 0), 2)
                 cv2.putText(display, f"Raw Y (Jump): {raw_y:.2f}", (10, 180), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
                             (200, 200, 200), 1)
             else:
-                cv2.putText(display, "RAM: INJECTING/SEARCHING...", (10, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.8,
+                cv2.putText(display, "RAM POS: INJECTING/SEARCHING...", (10, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.8,
                             (0, 0, 255), 2)
 
             # 5. FPS

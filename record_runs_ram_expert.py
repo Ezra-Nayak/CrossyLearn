@@ -121,7 +121,8 @@ class AlgorithmicExpert:
                         if dt > 0.05:
                             vx = (x - oldest_x) / dt
                             vz = (z - oldest_z) / dt
-                            if abs(vx) > 30.0: vx, vz = 0.0, 0.0
+                            # Raised cap from 30.0 to 50.0 to allow ultra-fast Train tracking
+                            if abs(vx) > 50.0: vx, vz = 0.0, 0.0
 
                     try:
                         bounds_data = self.pm.read_bytes(ptr + 0x0C, 12)
@@ -143,9 +144,14 @@ class AlgorithmicExpert:
                     if abs(x - player_x) < 0.5 and abs(z - player_z) < 0.5 and h < 0.5:
                         continue
 
-                    # Ignore invisible or under-map pooled objects
+                        # Ignore invisible or under-map pooled objects
                     if y < -1.0 or w < 0.05 or h < 0.01:
                         continue
+
+                        # Detect Railway Signal Poles (High Y, thin width, static)
+                    if y > 1.0 and w < 0.5 and h > 0.8 and not is_moving:
+                        terrain_map[rz + 1] = "RAIL"
+                        continue  # Do not add pole as a dodging obstacle to keep pathing clean
 
                     ent_type = "UNKNOWN"
                     if w > 10.0:
@@ -158,8 +164,12 @@ class AlgorithmicExpert:
                         ent_type = "LOG"
                         terrain_map[rz] = "RIVER"
                     elif h >= 0.4 and is_moving:
-                        ent_type = "CAR"
-                        terrain_map[rz] = "ROAD"
+                        if abs(vx) > 15.0:
+                            ent_type = "TRAIN"
+                            terrain_map[rz] = "RAIL"
+                        else:
+                            ent_type = "CAR"
+                            terrain_map[rz] = "ROAD"
                     elif h >= 0.15 and not is_moving and w < 2.0:
                         ent_type = "OBSTACLE"
                         terrain_map[rz] = "GRASS"
@@ -252,7 +262,8 @@ class AlgorithmicExpert:
             depth = len(path)
 
             # CURES STALE WAITING: Subtract time to force the bot to pick the FASTEST route
-            score = (z - player_z) * 10 - abs(x) * 0.5 - (t * 2.0)
+            # CENTER PRIORITY: Heavier penalty on abs(x) forces the bot to naturally return to the middle of the screen
+            score = (z - player_z) * 10 - abs(x) * 2.5 - (t * 2.0)
 
             if depth > longest_survival_depth:
                 longest_survival_depth = depth
@@ -300,14 +311,12 @@ class AlgorithmicExpert:
                 elif action == ACTION_RIGHT:
                     nx += 1
 
-                # SOTA KINEMATICS: Accurately model drifting on logs during Wait vs Air-Time
                 if action == ACTION_IDLE:
                     nt = t + 0.20
-                    x_land = x + (current_vx * 0.20)
+                    x_land = x
                 else:
                     nt = t + DT
-                    x_launch = x  # We drift while waiting to jump!
-                    x_land = x_launch
+                    x_land = x
                     if action == ACTION_LEFT:
                         x_land -= 1.0
                     elif action == ACTION_RIGHT:
@@ -329,9 +338,10 @@ class AlgorithmicExpert:
                     t_end = t + 0.25
 
                     for e in local_ents:
-                        if e['type'] in ['CAR', 'OBSTACLE'] and abs(e['z'] - z) < 0.5:
+                        if e['type'] in ['CAR', 'TRAIN', 'OBSTACLE'] and abs(e['z'] - z) < 0.5:
                             speed_pad = abs(e['vx']) * 0.05
-                            eff_w = e['w'] + (0.8 + speed_pad if e['type'] == 'CAR' else 0.2)
+                            base_pad = 0.8 if e['type'] in ['CAR', 'TRAIN'] else 0.2
+                            eff_w = e['w'] + base_pad + speed_pad
                             if AlgorithmicExpert._check_temporal_overlap(e['x'], e['vx'], eff_w, x_land, 0.8, t_start,
                                                                          t_end):
                                 is_safe = False
@@ -342,10 +352,11 @@ class AlgorithmicExpert:
                     t_grace_end = nt + 0.15
 
                     for e in local_ents:
-                        if e['type'] not in ['CAR', 'OBSTACLE']: continue
+                        if e['type'] not in ['CAR', 'TRAIN', 'OBSTACLE']: continue
 
                         speed_pad = abs(e['vx']) * 0.05
-                        eff_w = e['w'] + (0.8 + speed_pad if e['type'] == 'CAR' else 0.2)
+                        base_pad = 0.8 if e['type'] in ['CAR', 'TRAIN'] else 0.2
+                        eff_w = e['w'] + base_pad + speed_pad
 
                         if abs(e['z'] - z) < 0.5:
                             if AlgorithmicExpert._check_temporal_overlap(e['x'], e['vx'], eff_w, x, 0.8, t_wait_start,
@@ -400,10 +411,14 @@ def main():
         while True:
             # FIX: Adopt the standard RL Loop to prevent frame skipping
             latents, scalars, action_mask = env.reset()
-            trajectory = []
 
-            # The env.reset() loop waits for the UI to clear,
-            # now we are guaranteed to start cleanly on frame 1.
+            # Double check life status immediately after reset
+            _, _, _, is_alive, _ = env.get_state()
+            if not is_alive:
+                print("\n[SKIP] Environment reset into a dead state. Retrying...")
+                continue
+
+            trajectory = []
             print("\n[REC] Automated run started. Recording...")
 
             while True:

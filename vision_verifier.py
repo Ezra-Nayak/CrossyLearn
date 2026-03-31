@@ -12,6 +12,7 @@ from vision import VisionSystem
 # --- CONFIG ---
 WINDOW_TITLE = "Crossy Road"
 VAE_CHECKPOINT = "checkpoints/crossy_vae_best.pth"
+# VAE_CHECKPOINT = "checkpoints/crossy_vae_LOW_FIDELITY_ep5.pth"
 DISPLAY_SCALE = 5  # Scales up the 160x160 images for easier viewing
 
 

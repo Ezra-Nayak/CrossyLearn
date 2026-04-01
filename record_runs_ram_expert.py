@@ -14,37 +14,39 @@ ACTION_IDLE = 3
 
 class AlgorithmicExpert:
     def __init__(self):
-        try:
-            self.pm = pymem.Pymem("Crossy Road.exe")
-            print("[RAM BOT] Attached to Crossy Road memory.")
-        except Exception as e:
-            print(f"[RAM BOT ERROR] Could not attach to game: {e}")
-            self.pm = None
-
         self.TERRAIN_MANAGER_BASE = 0x00000000
         self.entity_vault_addr = None
         self.entity_history = {}
         self.known_terrain = {}  # Persistent terrain classification
         self.lilypad_memory = {}  # Persistent grid memory for lilypads: {rounded_z: (x, width)}
-        if self.pm:
-            self.inject_entity_tracker()
+        self.pm = None
+        self.attach_and_inject()
 
-    def inject_entity_tracker(self):
-        """Injects an Assembly Hash Map into the 3D Engine Transform Loop."""
+    def attach_and_inject(self):
+        """Attaches to the game process and injects the entity tracker."""
+        try:
+            self.pm = pymem.Pymem("Crossy Road.exe")
+            print("[RAM BOT] Attached to Crossy Road memory.")
+        except Exception:
+            self.pm = None
+            self.entity_vault_addr = None
+            return False
+
         try:
             aob_sig = b"\xF3\x0F\x10\x6E\x08\xF3\x0F\x10\x81"
             module = pymem.process.module_from_name(self.pm.process_handle, "UnityPlayer.dll")
             if not module:
                 print("[RAM ERROR] Could not find UnityPlayer.dll")
-                return
+                self.pm = None
+                return False
 
             module_data = self.pm.read_bytes(module.lpBaseOfDll, module.SizeOfImage)
             sig_offset = module_data.find(aob_sig)
 
             if sig_offset == -1:
                 print("[RAM ERROR] Could not find 3D Engine AOB signature. (Already injected?)")
-                # Assuming already injected if we can't find the original AOB
-                return
+                self.pm = None
+                return False
 
             target_addr = module.lpBaseOfDll + sig_offset
             alloc_addr = self.pm.allocate(17408)
@@ -82,14 +84,18 @@ class AlgorithmicExpert:
             kernel32.VirtualProtectEx(self.pm.process_handle, target_addr, 5, old_protect, ctypes.byref(old_protect))
 
             print(f"[RAM] 3D Geometry Hash Map injected! Vault at {hex(self.entity_vault_addr)}")
+            return True
 
         except Exception as e:
             print(f"[RAM ERROR] Injection Failed: {e}")
             self.entity_vault_addr = None
+            self.pm = None
+            return False
 
     def poll_world_state(self, player_x, player_z):
         if not self.pm or not self.entity_vault_addr:
-            return {}, []
+            if not self.attach_and_inject():
+                return {},[]
 
         try:
             vault_data = self.pm.read_bytes(self.entity_vault_addr, 16384)
@@ -212,6 +218,8 @@ class AlgorithmicExpert:
 
         except Exception as e:
             print(f"[POLL ERROR] {e}")
+            self.pm = None
+            self.entity_vault_addr = None
             return {}, []
 
     @staticmethod
@@ -425,10 +433,11 @@ def main():
                 terrain_ahead = "UNKNOWN"
                 hazards_ahead = []
 
-                if bot.pm:
-                    terrain_map, entities = bot.poll_world_state(player_x, player_z)
+                terrain_map, entities = bot.poll_world_state(player_x, player_z)
+                if terrain_map or entities:
                     terrain_ahead = terrain_map.get(round(player_z + 1), "GRASS")
                     action = bot.calculate_perfect_action(player_x, player_z, action_mask, terrain_map, entities)
+                    hazards_ahead = [e for e in entities if abs(e['z'] - (player_z + 1)) <= 0.8]
 
                 # Record BEFORE stepping (Matches vision state to intended action)
                 trajectory.append({
@@ -438,8 +447,6 @@ def main():
                     'action': action
                 })
 
-                if bot.pm:
-                    hazards_ahead = [e for e in entities if abs(e['z'] - (player_z + 1)) <= 0.8]
                 action_str = ['UP  ', 'LEFT', 'RGHT', 'IDLE'][action]
 
                 print(

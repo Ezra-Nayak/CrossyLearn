@@ -411,14 +411,10 @@ def main():
         while True:
             # FIX: Adopt the standard RL Loop to prevent frame skipping
             latents, scalars, action_mask = env.reset()
-
-            # Double check life status immediately after reset
-            _, _, _, is_alive, _ = env.get_state()
-            if not is_alive:
-                print("\n[SKIP] Environment reset into a dead state. Retrying...")
-                continue
-
             trajectory = []
+
+            # The env.reset() loop waits for the UI to clear,
+            # now we are guaranteed to start cleanly on frame 1.
             print("\n[REC] Automated run started. Recording...")
 
             while True:

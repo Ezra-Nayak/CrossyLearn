@@ -505,8 +505,8 @@ class CrossyGameEnv:
         scalars = np.array([norm_x], dtype=np.float32)
 
         # 4. RAM Death Detection (Event Hooked)
-        raw_state = self.ram_tracker.get_game_state()
-        is_alive = (raw_state == 1)  # Hooked: 1=Alive/Hop, 0=Death Event
+        # Uses the dual-patch sampling method updated in vision.py
+        is_alive = data['pause_visible']
 
         # Action Masking: 0:Up, 1:Left, 2:Right, 3:Idle
         action_mask = np.zeros(4, dtype=np.float32)
@@ -526,7 +526,7 @@ class CrossyGameEnv:
         if self.ui:
             self.ui.ram_x = self.last_known_coords[0]
             self.ui.ram_z = current_score
-            self.ui.game_state = "PLAYING" if is_alive else f"DEAD ({raw_state})"
+            self.ui.game_state = "PLAYING" if is_alive else "DEAD (Vision)"
             mask_str = []
             if action_mask[1] < -1: mask_str.append("L")
             if action_mask[2] < -1: mask_str.append("R")
@@ -554,19 +554,11 @@ class CrossyGameEnv:
 
             # SOTA: UI Clearing & Fresh Start Sequence
             # Forces the game to clear any "Tap to Start" overlays or initial menus.
+            # Sequence: Up, Right, Left, Right, Left
             time.sleep(3)  # Wait for the very first "Space" jump to land
-
             for cmd in ['up', 'right', 'left', 'right', 'left']:
                 pydirectinput.press(cmd)
-                # First run lag requires a slightly longer wait (300ms)
-                time.sleep(0.20)
-
-                # Verify we are still alive after this hop
-                # This prevents the "First Run Death" bug
-                _, _, _, is_alive, _ = self.get_state()
-                if not is_alive:
-                    self._log("[RESET] Died during initialization sequence. Retrying reset...")
-                    return self.reset()
+                time.sleep(0.25)  # Slightly longer delay to ensure UI clears and camera centers
 
         except Exception as e:
             self._log(f"[RECOVERY] Window manipulation failed (Target died): {e}")

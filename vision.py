@@ -128,52 +128,48 @@ class VisionSystem(threading.Thread):
     def detect_pause_button(self, frame):
         """
         Detects the two white vertical bars in the top right corner.
-        Uses specific tuned values from pause_roi_debugger.py.
+        Uses a dual-patch sampling method to avoid contour merging on chaotic backgrounds.
+        Scans a small section of the left pause bar and a small section of the right pause bar.
         Returns True if visible (Game Active), False if missing (Dead/Menu).
         """
         h, w, _ = frame.shape
 
         # --- TUNED PARAMETERS ---
-        THRESH_VAL = 254
-        SEARCH_WIDTH_PCT = 0.08
-        ROI_TOP_OFFSET = 110
-        ROI_HEIGHT_PCT = 0.06
-        RIGHT_BUFFER = 20
+        THRESH_VAL = 220
+        PATCH_SIZE = 8
+
+        # Offsets from the Top-Right corner (w, 0)
+        L_X_DIST = 73  # Left bar patch X distance from right edge
+        L_Y_DIST = 152  # Left bar patch Y distance from top edge
+
+        R_X_DIST = 45  # Right bar patch X distance from right edge
+        R_Y_DIST = 120  # Right bar patch Y distance from top edge
         # ------------------------
 
-        roi_w = int(w * SEARCH_WIDTH_PCT)
-        roi_h = int(h * ROI_HEIGHT_PCT)
+        lx1, lx2 = w - L_X_DIST, w - L_X_DIST + PATCH_SIZE
+        ly1, ly2 = L_Y_DIST, L_Y_DIST + PATCH_SIZE
 
-        roi_x1 = w - roi_w
-        roi_y1 = ROI_TOP_OFFSET
-        roi_x2 = w - RIGHT_BUFFER
-        roi_y2 = roi_y1 + roi_h
+        rx1, rx2 = w - R_X_DIST, w - R_X_DIST + PATCH_SIZE
+        ry1, ry2 = R_Y_DIST, R_Y_DIST + PATCH_SIZE
 
-        if roi_x1 < 0 or roi_y1 < 0: return False
+        # Bounds check
+        if lx1 < 0 or rx1 < 0 or ly2 > h or ry2 > h:
+            return False
 
-        roi = frame[roi_y1:roi_y2, roi_x1:roi_x2]
-        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        left_patch = frame[ly1:ly2, lx1:lx2]
+        right_patch = frame[ry1:ry2, rx1:rx2]
 
-        # High threshold for pure white UI elements
-        _, thresh = cv2.threshold(gray, THRESH_VAL, 255, cv2.THRESH_BINARY)
+        left_gray = cv2.cvtColor(left_patch, cv2.COLOR_BGR2GRAY)
+        right_gray = cv2.cvtColor(right_patch, cv2.COLOR_BGR2GRAY)
 
-        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        _, left_thresh = cv2.threshold(left_gray, THRESH_VAL, 255, cv2.THRESH_BINARY)
+        _, right_thresh = cv2.threshold(right_gray, THRESH_VAL, 255, cv2.THRESH_BINARY)
 
-        vertical_bars_found = 0
-        for c in contours:
-            area = cv2.contourArea(c)
-            if area < 15: continue  # Ignore dust/noise
+        # Require 80% of the pixels in both patches to be pure white
+        left_score = np.count_nonzero(left_thresh) / (PATCH_SIZE * PATCH_SIZE)
+        right_score = np.count_nonzero(right_thresh) / (PATCH_SIZE * PATCH_SIZE)
 
-            x, y, cw, ch = cv2.boundingRect(c)
-
-            # Geometric check for a vertical bar
-            aspect_ratio = float(ch) / cw if cw > 0 else 0
-
-            if aspect_ratio > 1.5:
-                vertical_bars_found += 1
-
-        # We need exactly 2 bars to confirm it's the pause button
-        return vertical_bars_found == 2
+        return (left_score > 0.8) and (right_score > 0.8)
 
     def run(self):
         with mss.mss() as sct:

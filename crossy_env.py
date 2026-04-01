@@ -189,19 +189,46 @@ class CrossyEnv:
         return np.array(grid_data), debug_patches
 
     def is_pause_visible(self, frame):
+        """
+        Detects the two white vertical bars in the top right corner.
+        Uses the dual-patch sampling method tuned in pause_roi_debugger.py.
+        """
         h, w, _ = frame.shape
-        roi_w = int(w * 0.08)
-        roi_h = int(h * 0.06)
-        roi = frame[110:110 + roi_h, w - roi_w:w - 20]
-        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-        _, mask = cv2.threshold(gray, 254, 255, cv2.THRESH_BINARY)
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        valid_bars = 0
-        for c in contours:
-            if cv2.contourArea(c) > 15:
-                _, _, cw, ch = cv2.boundingRect(c)
-                if ch / cw > 1.5: valid_bars += 1
-        return valid_bars == 2
+
+        # --- TUNED PARAMETERS ---
+        THRESH_VAL = 220
+        PATCH_SIZE = 8
+
+        # Offsets from the Top-Right corner (w, 0)
+        L_X_DIST = 73
+        L_Y_DIST = 152
+
+        R_X_DIST = 45
+        R_Y_DIST = 120
+        # ------------------------
+
+        lx1, lx2 = w - L_X_DIST, w - L_X_DIST + PATCH_SIZE
+        ly1, ly2 = L_Y_DIST, L_Y_DIST + PATCH_SIZE
+
+        rx1, rx2 = w - R_X_DIST, w - R_X_DIST + PATCH_SIZE
+        ry1, ry2 = R_Y_DIST, R_Y_DIST + PATCH_SIZE
+
+        if lx1 < 0 or rx1 < 0 or ly2 > h or ry2 > h:
+            return False
+
+        left_patch = frame[ly1:ly2, lx1:lx2]
+        right_patch = frame[ry1:ry2, rx1:rx2]
+
+        left_gray = cv2.cvtColor(left_patch, cv2.COLOR_BGR2GRAY)
+        right_gray = cv2.cvtColor(right_patch, cv2.COLOR_BGR2GRAY)
+
+        _, left_thresh = cv2.threshold(left_gray, THRESH_VAL, 255, cv2.THRESH_BINARY)
+        _, right_thresh = cv2.threshold(right_gray, THRESH_VAL, 255, cv2.THRESH_BINARY)
+
+        left_score = np.count_nonzero(left_thresh) / (PATCH_SIZE * PATCH_SIZE)
+        right_score = np.count_nonzero(right_thresh) / (PATCH_SIZE * PATCH_SIZE)
+
+        return (left_score > 0.8) and (right_score > 0.8)
 
     def reset(self):
         self.steps_in_episode = 0

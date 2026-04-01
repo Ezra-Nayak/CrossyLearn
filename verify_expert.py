@@ -10,7 +10,7 @@ from train_vision import SpatialVQVAE, setup_device
 
 # --- CONFIG ---
 VAE_CHECKPOINT = "checkpoints/crossy_vae_best.pth"
-DATA_DIR = "expert_data"
+DATA_DIR = r"D:\python\crossy_learn\expert_run"
 DISPLAY_SCALE = 6
 
 

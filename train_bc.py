@@ -10,15 +10,17 @@ from train_ppo import ActorCritic, PPO_DEVICE
 
 # --- CONFIG ---
 BATCH_SIZE = 64
-EPOCHS = 25
+EPOCHS = 50
 LR = 1e-4
 
-NOISE = 0.03
+NOISE = 0.05
+
+DATA_DIR = r"D:\python\crossy_learn\expert_run" # !!!!!!!~~~~~~~~~~~~
 
 
 class ExpertDataset(Dataset):
-    def __init__(self, data_dir="expert_data", snip_start_frames=3, snip_end_frames=10):
-        files = glob.glob(f"{data_dir}/pass/*.pt")
+    def __init__(self, data_dir=DATA_DIR, snip_start_frames=3, snip_end_frames=10):
+        files = glob.glob(os.path.join(data_dir, "*.pt"))
 
         self.clean_data =[]
         action_counts = {0: 0, 1: 0, 2: 0, 3: 0}

@@ -154,11 +154,6 @@ class AlgorithmicExpert:
                     if y < -0.4 or w < 0.05 or h < 0.01:
                         continue
 
-                        # Detect Railway Signal Poles (High Y, thin width, static)
-                    if y > 1.0 and w < 0.5 and h > 0.8 and not is_moving:
-                        terrain_map[rz + 1] = "RAIL"
-                        continue  # Do not add pole as a dodging obstacle to keep pathing clean
-
                     ent_type = "UNKNOWN"
                     if w > 10.0:
                         continue
@@ -172,12 +167,8 @@ class AlgorithmicExpert:
                         ent_type = "LOG"
                         terrain_map[rz] = "RIVER"
                     elif h >= 0.4 and is_moving:
-                        if abs(vx) > 15.0:
-                            ent_type = "TRAIN"
-                            terrain_map[rz] = "RAIL"
-                        else:
-                            ent_type = "CAR"
-                            terrain_map[rz] = "ROAD"
+                        ent_type = "CAR"
+                        terrain_map[rz] = "ROAD"
                     elif h >= 0.15 and not is_moving and w < 2.0:
                         ent_type = "OBSTACLE"
                         terrain_map[rz] = "GRASS"
@@ -255,7 +246,7 @@ class AlgorithmicExpert:
         import heapq
 
         MAX_DEPTH = 12
-        DT = 0.2
+        DT = 0.1
 
         BOUND_LEFT = -4.5
         BOUND_RIGHT = 4.5
@@ -322,7 +313,7 @@ class AlgorithmicExpert:
                 if action == ACTION_IDLE:
                     nt = t + 0.20
                     # Apply log drift during idle state!
-                    x_land = x + (current_vx * 0.20)
+                    x_land = x + (current_vx * 0.05)
                 else:
                     nt = t + DT
                     # Apply log drift momentum during the jump air-time!
@@ -408,7 +399,9 @@ class AlgorithmicExpert:
 
 
 def main():
-    os.makedirs("expert_data", exist_ok=True)
+    # Use raw string (r"") for Windows paths to handle backslashes correctly
+    target_dir = r"D:\python\crossy_learn\expert_run"
+    os.makedirs(target_dir, exist_ok=True)
     print("--- AUTOMATED RAM-EXPERT RECORDER ---")
 
     env = CrossyGameEnv(ui=None)
@@ -466,9 +459,9 @@ def main():
                 if done:
                     # FIX: Wait a beat before saving/resetting to ensure game state settles
                     time.sleep(1)
-                    if len(trajectory) > 60:
+                    if len(trajectory) > 40:
                         episodes_recorded += 1
-                        filename = f"expert_data/ram_bot_run_{int(time.time())}.pt"
+                        filename = os.path.join(target_dir, f"ram_bot_run_{int(time.time())}.pt")
                         torch.save(trajectory, filename)
                         print(
                             f"\n[SAVE] Bot died. Saved {len(trajectory)} perfect frames to {filename} (Total Runs: {episodes_recorded})")

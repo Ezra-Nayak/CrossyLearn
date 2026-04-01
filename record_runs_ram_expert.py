@@ -150,8 +150,8 @@ class AlgorithmicExpert:
                     if abs(x - player_x) < 0.5 and abs(z - player_z) < 0.5 and h < 0.5:
                         continue
 
-                        # Ignore invisible or under-map pooled objects
-                    if y < -1.0 or w < 0.05 or h < 0.01:
+                        # Ignore invisible or under-map pooled objects (Stricter Y check for fake lilypads)
+                    if y < -0.4 or w < 0.05 or h < 0.01:
                         continue
 
                         # Detect Railway Signal Poles (High Y, thin width, static)
@@ -161,6 +161,8 @@ class AlgorithmicExpert:
 
                     ent_type = "UNKNOWN"
                     if w > 10.0:
+                        continue
+                    if w < 0.25 and h < 0.05:
                         continue
                     elif h < 0.12 and w < 1.0:
                         ent_type = "LILYPAD"
@@ -247,18 +249,21 @@ class AlgorithmicExpert:
     def calculate_perfect_action(self, player_x, player_z, action_mask, terrain_map, entities):
         """
         100% ENGINE-ACCURATE Pathfinding using 2D Continuous Collision Detection (CCD).
-        Calculates interpolations during jump air-time to prevent tail clipping.
+        Upgraded to Time-based Uniform Cost Search (Dijkstra) for optimal fast pathing.
+        Applies mathematical drift for log riding.
         """
-        import collections
+        import heapq
 
-        MAX_DEPTH = 5
+        MAX_DEPTH = 12
         DT = 0.2
 
         BOUND_LEFT = -4.5
         BOUND_RIGHT = 4.5
         ACTIONS = [ACTION_UP, ACTION_LEFT, ACTION_RIGHT, ACTION_IDLE]
 
-        queue = collections.deque([(player_x, player_z, 0.0, [])])
+        # Priority Queue: (time_t, -score, x, z, path)
+        queue = []
+        heapq.heappush(queue, (0.0, 0.0, player_x, player_z, []))
         visited = set()
 
         best_score = -float('inf')
@@ -266,20 +271,15 @@ class AlgorithmicExpert:
         longest_survival_depth = 0
 
         while queue:
-            x, z, t, path = queue.popleft()
+            t, neg_score, x, z, path = heapq.heappop(queue)
+            score = -neg_score
             depth = len(path)
 
-            # CURES STALE WAITING: Subtract time to force the bot to pick the FASTEST route
-            # CENTER PRIORITY: Heavier penalty on abs(x) forces the bot to naturally return to the middle of the screen
-            score = (z - player_z) * 10 - abs(x) * 2.5 - (t * 2.0)
-
+            # Prioritize paths that reach the deepest depth safely, breaking ties with the highest score
             if depth > longest_survival_depth:
                 longest_survival_depth = depth
                 best_score = score
-                if path:
-                    best_first_action = path[0]
-                else:
-                    best_first_action = ACTION_IDLE
+                best_first_action = path[0] if path else ACTION_IDLE
             elif depth == longest_survival_depth and depth > 0:
                 if score > best_score:
                     best_score = score
@@ -321,10 +321,12 @@ class AlgorithmicExpert:
 
                 if action == ACTION_IDLE:
                     nt = t + 0.20
-                    x_land = x
+                    # Apply log drift during idle state!
+                    x_land = x + (current_vx * 0.20)
                 else:
                     nt = t + DT
-                    x_land = x
+                    # Apply log drift momentum during the jump air-time!
+                    x_land = x + (current_vx * DT)
                     if action == ACTION_LEFT:
                         x_land -= 1.0
                     elif action == ACTION_RIGHT:
@@ -395,7 +397,12 @@ class AlgorithmicExpert:
                     state_key = (round(x_land * 2) / 2.0, round(nz), round(nt * 5))
                     if state_key not in visited:
                         visited.add(state_key)
-                        queue.append((x_land, nz, nt, path + [action]))
+
+                        # Heavy reward for moving forward, penalty for time elapsed and moving away from center
+                        new_score = (nz - player_z) * 10.0 - abs(x_land) * 2.5 - (nt * 2.0)
+
+                        # Push to Priority Queue (t dictates expansion order, -new_score tracks best paths)
+                        heapq.heappush(queue, (nt, -new_score, x_land, nz, path + [action]))
 
         return best_first_action
 

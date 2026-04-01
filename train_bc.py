@@ -13,13 +13,14 @@ BATCH_SIZE = 64
 EPOCHS = 25
 LR = 1e-4
 
+NOISE = 0.03
+
 
 class ExpertDataset(Dataset):
-    def __init__(self, data_dir="expert_data", snip_seconds=2.0):
-        files = glob.glob(f"{data_dir}/*.pt")
-        snip_frames = int(snip_seconds * 10)  # 10 FPS
+    def __init__(self, data_dir="expert_data", snip_start_frames=3, snip_end_frames=10):
+        files = glob.glob(f"{data_dir}/pass/*.pt")
 
-        self.clean_data = []
+        self.clean_data =[]
         action_counts = {0: 0, 1: 0, 2: 0, 3: 0}
         total_snipped = 0
 
@@ -27,12 +28,13 @@ class ExpertDataset(Dataset):
             trajectory = torch.load(f, weights_only=False)
 
             # --- TRAJECTORY TRIMMING ---
-            # Snip the first and last few seconds to remove menu lag and death-throes.
-            if len(trajectory) <= (snip_frames * 2) + 5:
+            # The RAM Bot environment already waits for UI to clear during reset.
+            # We only snip the first 5 frames (camera settling) and last 3 frames (imminent collision state).
+            if len(trajectory) <= (snip_start_frames + snip_end_frames) + 5:
                 total_snipped += len(trajectory)
                 continue  # Skip runs that are too short to be meaningful
 
-            trimmed_trajectory = trajectory[snip_frames: -snip_frames]
+            trimmed_trajectory = trajectory[snip_start_frames: -snip_end_frames]
             total_snipped += (len(trajectory) - len(trimmed_trajectory))
 
             for item in trimmed_trajectory:
@@ -42,19 +44,15 @@ class ExpertDataset(Dataset):
                 act = int(item['action'])
 
                 # --- DATA CLEANING ---
-                # Force label to IDLE if human pressed a blocked key
+                # Force label to IDLE if a blocked key was somehow recorded
                 if mask[act] < -1:
                     act = 3 if mask[3] == 0 else 0
 
                 self.clean_data.append((lat, sca, mask, act))
                 action_counts[act] += 1
 
-        print(f"[DATA] Loaded {len(files)} runs. Snipped {total_snipped} low-quality frames.")
+        print(f"[DATA] Loaded {len(files)} runs. Snipped {total_snipped} edge frames.")
         print(f"[DATA] Clean samples: {len(self.clean_data)}")
-        print(
-            f"[DATA] Action Distribution -> Up: {action_counts[0]}, Left: {action_counts[1]}, Right: {action_counts[2]}, Idle: {action_counts[3]}")
-
-        print(f"[DATA] Loaded {len(files)} runs ({len(self.clean_data)} steps).")
         print(
             f"[DATA] Action Distribution -> Up: {action_counts[0]}, Left: {action_counts[1]}, Right: {action_counts[2]}, Idle: {action_counts[3]}")
 
@@ -129,11 +127,21 @@ def train():
         for lat, sca, mask, act in train_loader:
             lat, sca, mask, act = lat.to(PPO_DEVICE), sca.to(PPO_DEVICE), mask.to(PPO_DEVICE), act.to(PPO_DEVICE)
 
+            # --- DATA AUGMENTATION (Latent Noise) ---
+            # Inject 5% Gaussian noise into the latent space.
+            # This acts as a heavy regularizer to completely obliterate memorization.
+            noise = torch.randn_like(lat) * NOISE
+            lat = lat + noise
+
             # --- DATA AUGMENTATION (Horizontal Flip) ---
             # 50% chance to flip the screen and swap Left/Right actions
             if torch.rand(1).item() > 0.5:
                 # Latents shape is [B, 128, 20, 20]. Flip the width dimension (dim=3).
                 lat = torch.flip(lat, dims=[3])
+
+                # CRITICAL FIX: Invert the scalar X coordinate!
+                # If the screen flips, a chicken on the left (-X) is now on the right (+X).
+                sca = -sca
 
                 # Swap mask limits for Left (1) and Right (2)
                 mask = mask[:, [0, 2, 1, 3]]

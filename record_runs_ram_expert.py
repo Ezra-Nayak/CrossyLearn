@@ -202,7 +202,7 @@ class AlgorithmicExpert:
                 del self.lilypad_memory[k]
 
             # 4. Fill Grid Gaps
-            min_z, max_z = int(player_z) - 5, int(player_z) + 30
+            min_z, max_z = int(player_z) - 5, int(player_z) + 14
             for tz in range(min_z, max_z):
                 if tz not in terrain_map:
                     terrain_map[tz] = "GRASS"
@@ -245,7 +245,7 @@ class AlgorithmicExpert:
         """
         import heapq
 
-        MAX_DEPTH = 12
+        MAX_DEPTH = 7
         DT = 0.1
 
         BOUND_LEFT = -4.5
@@ -260,6 +260,7 @@ class AlgorithmicExpert:
         best_score = -float('inf')
         best_first_action = ACTION_IDLE
         longest_survival_depth = 0
+        depth_0_safety = {ACTION_UP: False, ACTION_LEFT: False, ACTION_RIGHT: False, ACTION_IDLE: False}
 
         while queue:
             t, neg_score, x, z, path = heapq.heappop(queue)
@@ -313,7 +314,7 @@ class AlgorithmicExpert:
                 if action == ACTION_IDLE:
                     nt = t + 0.20
                     # Apply log drift during idle state!
-                    x_land = x + (current_vx * 0.05)
+                    x_land = x + (current_vx * 0.2)
                 else:
                     nt = t + DT
                     # Apply log drift momentum during the jump air-time!
@@ -384,6 +385,9 @@ class AlgorithmicExpert:
                         is_safe = False
 
                 if is_safe:
+                    if depth == 0:
+                        depth_0_safety[action] = True
+
                     # CURES STALE PATH PRUNING: Quantize Time in state key so identical locations at different times are verified!
                     state_key = (round(x_land * 2) / 2.0, round(nz), round(nt * 5))
                     if state_key not in visited:
@@ -395,7 +399,7 @@ class AlgorithmicExpert:
                         # Push to Priority Queue (t dictates expansion order, -new_score tracks best paths)
                         heapq.heappush(queue, (nt, -new_score, x_land, nz, path + [action]))
 
-        return best_first_action
+        return best_first_action, depth_0_safety
 
 
 def main():
@@ -433,18 +437,27 @@ def main():
                 terrain_ahead = "UNKNOWN"
                 hazards_ahead = []
 
+                safety_vector = [0.0, 0.0, 0.0, 1.0]  # Default to IDLE being safe
                 terrain_map, entities = bot.poll_world_state(player_x, player_z)
                 if terrain_map or entities:
                     terrain_ahead = terrain_map.get(round(player_z + 1), "GRASS")
-                    action = bot.calculate_perfect_action(player_x, player_z, action_mask, terrain_map, entities)
+                    action, safe_dict = bot.calculate_perfect_action(player_x, player_z, action_mask, terrain_map,
+                                                                     entities)
                     hazards_ahead = [e for e in entities if abs(e['z'] - (player_z + 1)) <= 0.8]
+                    safety_vector = [
+                        1.0 if safe_dict[ACTION_UP] else 0.0,
+                        1.0 if safe_dict[ACTION_LEFT] else 0.0,
+                        1.0 if safe_dict[ACTION_RIGHT] else 0.0,
+                        1.0 if safe_dict[ACTION_IDLE] else 0.0
+                    ]
 
                 # Record BEFORE stepping (Matches vision state to intended action)
                 trajectory.append({
                     'latents': latents,
                     'scalars': scalars,
                     'mask': action_mask,
-                    'action': action
+                    'action': action,
+                    'safety': safety_vector
                 })
 
                 action_str = ['UP  ', 'LEFT', 'RGHT', 'IDLE'][action]

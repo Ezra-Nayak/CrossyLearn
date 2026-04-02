@@ -254,8 +254,10 @@ class ActorCritic(nn.Module):
         self.actor = nn.Sequential(
             layer_init(nn.Linear(cnn_out_dim + scalar_dim, HIDDEN_DIM)),
             nn.Tanh(),
+            nn.Dropout(0.2),  # Prevent BC memorization
             layer_init(nn.Linear(HIDDEN_DIM, HIDDEN_DIM)),
             nn.Tanh(),
+            nn.Dropout(0.2),  # Prevent BC memorization
             layer_init(nn.Linear(HIDDEN_DIM, action_dim), std=0.01)
         )
 
@@ -315,9 +317,18 @@ class ActorCritic(nn.Module):
 
 
 class PPO:
-    def __init__(self, action_dim):
+    def __init__(self, action_dim, is_resuming_bc=False):
         # Force PPO to CPU. No state_dim needed, CNN handles it automatically.
         self.policy = ActorCritic(action_dim).to(PPO_DEVICE)
+
+        # SOTA: If resuming from BC, freeze the Actor.
+        # This prevents the randomized Critic gradients from ruining the expert policy
+        # while the Critic "warms up" to the expert's behavior.
+        if is_resuming_bc:
+            for param in self.policy.actor.parameters():
+                param.requires_grad = False
+            print("[PPO] Expert Actor FROZEN. Critic warming up...")
+
         self.optimizer = optim.Adam(self.policy.parameters(), lr=LR)
         self.policy_old = ActorCritic(action_dim).to(PPO_DEVICE)
         self.policy_old.load_state_dict(self.policy.state_dict())
@@ -627,15 +638,6 @@ class CrossyGameEnv:
             reward -= 1.0 * (self.last_score - score)
             self.last_score = score
             self.steps_stationary = 0
-        else:
-            # THE "TICK" PENALTY: Cure Cowardice.
-            # If the chicken didn't move forward or backward, it stood still (or moved sideways).
-            self.steps_stationary += 1
-            reward -= 0.05
-
-            # Stronger sideways penalty
-        if action == 1 or action == 2:
-            reward -= 0.1
 
         # Death Detection
         if not is_alive:
@@ -695,7 +697,12 @@ def train():
     env = CrossyGameEnv(ui)
 
     # Action Dim: 4 (Up, Left, Right, Idle)
-    ppo = PPO(4)
+    checkpoints = glob.glob("checkpoints/ppo_crossy_*.pth")
+    # Identify if we are at the start of training (e.g. episode 0-50 after BC)
+    is_bc_resume = len(checkpoints) > 0 and int(
+        max(checkpoints, key=lambda x: int(x.split('_')[-1].split('.')[0])).split('_')[-1].split('.')[0]) < 10
+
+    ppo = PPO(4, is_resuming_bc=is_bc_resume)
     memory = Memory()
 
     start_episode = 1
@@ -784,6 +791,13 @@ def train():
 
                     # Update Policy
                     if time_step % UPDATE_TIMESTEP == 0:
+                        # Auto-Unfreeze Actor after enough Critic training (approx episode 50)
+                        if i_episode > 500:
+                            for param in ppo.policy.actor.parameters():
+                                if not param.requires_grad:
+                                    param.requires_grad = True
+                                    ui.log("[PPO] Critic warmed up. Actor UNFROZEN.")
+
                         ui.log(f"[PPO] Updating Policy at Step {time_step}...")
                         ui.refresh(live, force=True)  # Show the log once before the update starts
                         ppo.update(memory)

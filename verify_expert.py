@@ -11,7 +11,7 @@ from train_vision import SpatialVQVAE, setup_device
 # --- CONFIG ---
 VAE_CHECKPOINT = "checkpoints/crossy_vae_best.pth"
 DATA_DIR = r"D:\python\crossy_learn\expert_run"
-DISPLAY_SCALE = 6
+DISPLAY_SCALE = 3
 
 
 def main():
@@ -69,6 +69,7 @@ def main():
             scalar = step['scalars'][0]
             mask = step['mask']
             action = step['action']
+            safety = step.get('safety', None)
 
             z_c, z_t = torch.split(latents, 64, dim=0)
 
@@ -94,19 +95,61 @@ def main():
             if mask_status:
                 cv2.putText(display, " | ".join(mask_status), (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
 
+            # --- LIDAR VISUALIZATION ---
+            if safety is not None:
+                safe_acts = []
+                if safety[0] > 0.5: safe_acts.append("UP")
+                if safety[1] > 0.5: safe_acts.append("LEFT")
+                if safety[2] > 0.5: safe_acts.append("RIGHT")
+                if safety[3] > 0.5: safe_acts.append("IDLE")
+
+                # Yellow if multiple options exist, Orange if forced into a single choice
+                lidar_color = (0, 255, 255) if len(safe_acts) > 1 else (0, 150, 255)
+                cv2.putText(display, f"Lidar Safe: {', '.join(safe_acts)}", (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                            lidar_color, 2)
+
+            # --- LATENT VISUALIZATION ---
+            def get_latent_vis(z):
+                zm = z.mean(dim=0).cpu().numpy()
+                z_min, z_max = zm.min(), zm.max()
+                if z_max - z_min > 1e-5:
+                    zm = ((zm - z_min) / (z_max - z_min) * 255).astype(np.uint8)
+                else:
+                    zm = np.zeros_like(zm, dtype=np.uint8)
+                return cv2.applyColorMap(zm, cv2.COLORMAP_INFERNO)
+
+            vis_zc = get_latent_vis(z_c)
+            vis_zt = get_latent_vis(z_t)
+
+            latent_h_half = h * DISPLAY_SCALE // 2
+            latent_w_scaled = int(latent_h_half * (w / h))
+
+            vis_zc_rs = cv2.resize(vis_zc, (latent_w_scaled, latent_h_half), interpolation=cv2.INTER_NEAREST)
+            vis_zt_rs = cv2.resize(vis_zt, (latent_w_scaled, h * DISPLAY_SCALE - latent_h_half),
+                                   interpolation=cv2.INTER_NEAREST)
+
+            cv2.putText(vis_zc_rs, "Latent z_c", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            cv2.putText(vis_zt_rs, "Latent z_t", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+            latents_col = cv2.vconcat([vis_zc_rs, vis_zt_rs])
+            combined_display = cv2.hconcat([display, latents_col])
+
+            total_w = w * DISPLAY_SCALE + latent_w_scaled
+            total_h = h * DISPLAY_SCALE
+
             # --- DRAW CONTROL PANEL ---
             panel_height = 160
-            canvas = np.zeros((h * DISPLAY_SCALE + panel_height, w * DISPLAY_SCALE, 3), dtype=np.uint8)
-            canvas[:h * DISPLAY_SCALE, :] = display
+            canvas = np.zeros((total_h + panel_height, total_w, 3), dtype=np.uint8)
+            canvas[:total_h, :] = combined_display
 
-            panel_y = h * DISPLAY_SCALE
-            cv2.rectangle(canvas, (0, panel_y), (w * DISPLAY_SCALE, panel_y + panel_height), (30, 30, 30), -1)
-            cv2.line(canvas, (0, panel_y), (w * DISPLAY_SCALE, panel_y), (255, 255, 255), 2)
+            panel_y = total_h
+            cv2.rectangle(canvas, (0, panel_y), (total_w, panel_y + panel_height), (30, 30, 30), -1)
+            cv2.line(canvas, (0, panel_y), (total_w, panel_y), (255, 255, 255), 2)
 
             # Progress Bar
             progress = frame_idx / max(1, len(trajectory) - 1)
-            bar_w = int(progress * (w * DISPLAY_SCALE - 40))
-            cv2.rectangle(canvas, (20, panel_y + 15), (w * DISPLAY_SCALE - 20, panel_y + 25), (60, 60, 60), -1)
+            bar_w = int(progress * (total_w - 40))
+            cv2.rectangle(canvas, (20, panel_y + 15), (total_w - 20, panel_y + 25), (60, 60, 60), -1)
 
             bar_color = (0, 50, 255) if eagle_warning else (0, 200, 100)
             cv2.rectangle(canvas, (20, panel_y + 15), (20 + bar_w, panel_y + 25), bar_color, -1)
@@ -126,7 +169,7 @@ def main():
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
 
             # Controls Help
-            controls_x = w * DISPLAY_SCALE - 300
+            controls_x = total_w - 300
             cv2.putText(canvas, "[SPACE] Play/Pause | [A/D] Scrub", (controls_x, panel_y + 55),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
             cv2.putText(canvas, "[Y] Pass | [N] Fail", (controls_x, panel_y + 80), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
@@ -137,7 +180,7 @@ def main():
                         0.5, (150, 150, 150), 1)
 
             if paused:
-                cv2.putText(canvas, "PAUSED", (w * DISPLAY_SCALE // 2 - 50, panel_y + 140), cv2.FONT_HERSHEY_SIMPLEX,
+                cv2.putText(canvas, "PAUSED", (total_w // 2 - 50, panel_y + 140), cv2.FONT_HERSHEY_SIMPLEX,
                             0.8, (0, 0, 255), 2)
 
             cv2.imshow("Triage Control Center", canvas)

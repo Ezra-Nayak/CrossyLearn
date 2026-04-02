@@ -10,18 +10,16 @@ from train_ppo import ActorCritic, PPO_DEVICE
 
 # --- CONFIG ---
 BATCH_SIZE = 64
-EPOCHS = 50
+EPOCHS = 25
 LR = 1e-4
 
 NOISE = 0.05
 
-DATA_DIR = r"D:\python\crossy_learn\expert_run" # !!!!!!!~~~~~~~~~~~~
+DATA_DIR = r"D:\python\crossy_learn\expert_run" # !!!!
 
 
 class ExpertDataset(Dataset):
-    def __init__(self, data_dir=DATA_DIR, snip_start_frames=3, snip_end_frames=10):
-        files = glob.glob(os.path.join(data_dir, "*.pt"))
-
+    def __init__(self, files, snip_start_frames=3, snip_end_frames=10):
         self.clean_data =[]
         action_counts = {0: 0, 1: 0, 2: 0, 3: 0}
         total_snipped = 0
@@ -50,7 +48,26 @@ class ExpertDataset(Dataset):
                 if mask[act] < -1:
                     act = 3 if mask[3] == 0 else 0
 
-                self.clean_data.append((lat, sca, mask, act))
+                # --- SOFT TARGET LIDAR LABELS ---
+                safety = item.get('safety', None)
+                target_prob = torch.zeros(4)
+
+                if safety is not None:
+                    safety_t = torch.FloatTensor(safety)
+                    safety_t[mask < -1] = 0.0  # Mask out trees/boundaries
+                    safety_t[act] = 1.0  # Guarantee expert action is 1.0
+
+                    safe_count = safety_t.sum().item()
+                    if safe_count > 1:
+                        target_prob = safety_t * (0.3 / (safe_count - 1))
+                        target_prob[act] = 0.7  # Expert action gets primary focus
+                    else:
+                        target_prob[act] = 1.0
+                else:
+                    # 10GB Data Fallback: old runs without lidar get strict labels
+                    target_prob[act] = 1.0
+
+                self.clean_data.append((lat, sca, mask, target_prob, act))
                 action_counts[act] += 1
 
         print(f"[DATA] Loaded {len(files)} runs. Snipped {total_snipped} edge frames.")
@@ -88,16 +105,25 @@ def get_next_checkpoint_name():
 
 def train():
     os.makedirs("checkpoints", exist_ok=True)
-    dataset = ExpertDataset()
 
-    if len(dataset) == 0:
+    # --- TRAIN / VALIDATION SPLIT (BY FILE) ---
+    # Prevents "Temporal Leakage" where adjacent frames are split between Train and Val.
+    all_files = glob.glob(os.path.join(DATA_DIR, "*.pt"))
+    np.random.shuffle(all_files)
+
+    split_idx = int(0.85 * len(all_files))
+    train_files = all_files[:split_idx]
+    val_files = all_files[split_idx:]
+
+    if not all_files:
         print("[ERROR] No expert data found. Run record_expert.py first!")
         return
 
-    # --- TRAIN / VALIDATION SPLIT ---
-    train_size = int(0.85 * len(dataset))
-    val_size = len(dataset) - train_size
-    train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
+    train_dataset = ExpertDataset(train_files)
+    val_dataset = ExpertDataset(val_files)
+
+    train_size = len(train_dataset)
+    val_size = len(val_dataset)
 
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
@@ -114,7 +140,9 @@ def train():
 
     # Added Weight Decay (L2 Regularization) to heavily penalize memorization
     optimizer = optim.Adam(model.parameters(), lr=LR, weight_decay=1e-4)
-    criterion = nn.CrossEntropyLoss(weight=dataset.class_weights)
+
+    # Label Smoothing prevents the model from becoming over-confident on ambiguous frames.
+    criterion = nn.CrossEntropyLoss(weight=train_dataset.class_weights, label_smoothing=0.15)
 
     print(f"\n--- STARTING BEHAVIORAL CLONING ({train_size} Train | {val_size} Val) ---")
 
@@ -126,8 +154,9 @@ def train():
         total_train_loss = 0
         correct_train = 0
 
-        for lat, sca, mask, act in train_loader:
-            lat, sca, mask, act = lat.to(PPO_DEVICE), sca.to(PPO_DEVICE), mask.to(PPO_DEVICE), act.to(PPO_DEVICE)
+        for lat, sca, mask, target_prob, act in train_loader:
+            lat, sca, mask, target_prob, act = lat.to(PPO_DEVICE), sca.to(PPO_DEVICE), mask.to(
+                PPO_DEVICE), target_prob.to(PPO_DEVICE), act.to(PPO_DEVICE)
 
             # --- DATA AUGMENTATION (Latent Noise) ---
             # Inject 5% Gaussian noise into the latent space.
@@ -138,7 +167,7 @@ def train():
             # --- DATA AUGMENTATION (Horizontal Flip) ---
             # 50% chance to flip the screen and swap Left/Right actions
             if torch.rand(1).item() > 0.5:
-                # Latents shape is [B, 128, 20, 20]. Flip the width dimension (dim=3).
+                # Latents shape is[B, 128, 20, 20]. Flip the width dimension (dim=3).
                 lat = torch.flip(lat, dims=[3])
 
                 # CRITICAL FIX: Invert the scalar X coordinate!
@@ -148,7 +177,10 @@ def train():
                 # Swap mask limits for Left (1) and Right (2)
                 mask = mask[:, [0, 2, 1, 3]]
 
-                # Swap human actions
+                # Swap the soft probability distributions for Left and Right
+                target_prob = target_prob[:, [0, 2, 1, 3]]
+
+                # Swap human actions (for accuracy metrics)
                 act_flipped = act.clone()
                 act_flipped[act == 1] = 2
                 act_flipped[act == 2] = 1
@@ -158,7 +190,7 @@ def train():
             logits = model.actor(features)
 
             logits = logits + mask
-            loss = criterion(logits, act)
+            loss = criterion(logits, target_prob)  # Use soft labels instead of hard index
 
             optimizer.zero_grad()
             loss.backward()
@@ -175,15 +207,16 @@ def train():
         correct_val = 0
 
         with torch.no_grad():
-            for lat, sca, mask, act in val_loader:
-                lat, sca, mask, act = lat.to(PPO_DEVICE), sca.to(PPO_DEVICE), mask.to(PPO_DEVICE), act.to(PPO_DEVICE)
+            for lat, sca, mask, target_prob, act in val_loader:
+                lat, sca, mask, target_prob, act = lat.to(PPO_DEVICE), sca.to(PPO_DEVICE), mask.to(
+                    PPO_DEVICE), target_prob.to(PPO_DEVICE), act.to(PPO_DEVICE)
 
                 # No augmentation during validation
                 features = model._get_features(lat, sca)
                 logits = model.actor(features)
                 logits = logits + mask
 
-                loss = criterion(logits, act)
+                loss = criterion(logits, target_prob)  # Soft validation loss
                 total_val_loss += loss.item()
 
                 predictions = torch.argmax(logits, dim=1)

@@ -10,12 +10,12 @@ from train_ppo import ActorCritic, PPO_DEVICE
 
 # --- CONFIG ---
 BATCH_SIZE = 64
-EPOCHS = 25
+EPOCHS = 50
 LR = 1e-4
 
 NOISE = 0.05
 
-DATA_DIR = r"D:\python\crossy_learn\expert_run" # !!!!
+DATA_DIR = r"D:\python\crossy_learn\expert_run\pass" # !!!!
 
 
 class ExpertDataset(Dataset):
@@ -53,19 +53,32 @@ class ExpertDataset(Dataset):
                 target_prob = torch.zeros(4)
 
                 if safety is not None:
-                    safety_t = torch.FloatTensor(safety)
-                    safety_t[mask < -1] = 0.0  # Mask out trees/boundaries
-                    safety_t[act] = 1.0  # Guarantee expert action is 1.0
+                    # Filter safety by mask (ignore directions blocked by trees/walls)
+                    valid_mask = (mask >= -1.0).float()
+                    safety_t = torch.FloatTensor(safety) * valid_mask
+
+                    # Ensure the expert's chosen action is always considered safe
+                    safety_t[act] = 1.0
 
                     safe_count = safety_t.sum().item()
                     if safe_count > 1:
+                        # Distribute 30% probability across all safe alternative actions
+                        # This teaches the AI "This was the best move, but these were also okay."
                         target_prob = safety_t * (0.3 / (safe_count - 1))
-                        target_prob[act] = 0.7  # Expert action gets primary focus
+                        target_prob[act] = 0.7
                     else:
+                        # Only one safe action exists
                         target_prob[act] = 1.0
                 else:
-                    # 10GB Data Fallback: old runs without lidar get strict labels
-                    target_prob[act] = 1.0
+                    # Fallback for any frames missing lidar data:
+                    # Apply manual smoothing only to non-blocked actions
+                    valid_mask = (mask >= -1.0).float()
+                    valid_count = valid_mask.sum().item()
+                    if valid_count > 1:
+                        target_prob = valid_mask * (0.15 / (valid_count - 1))
+                        target_prob[act] = 0.85
+                    else:
+                        target_prob[act] = 1.0
 
                 self.clean_data.append((lat, sca, mask, target_prob, act))
                 action_counts[act] += 1
@@ -75,18 +88,9 @@ class ExpertDataset(Dataset):
         print(
             f"[DATA] Action Distribution -> Up: {action_counts[0]}, Left: {action_counts[1]}, Right: {action_counts[2]}, Idle: {action_counts[3]}")
 
-        # --- CLASS WEIGHTING ---
-        # Prevent the AI from just learning to "Stand Still" since most frames are IDLE.
-        total_samples = len(self.clean_data)
-        self.class_weights = torch.zeros(4, device=PPO_DEVICE)
-        for i in range(4):
-            # Inverse frequency weighting
-            if action_counts[i] > 0:
-                self.class_weights[i] = total_samples / (4.0 * action_counts[i])
-            else:
-                self.class_weights[i] = 1.0
-
-        print(f"[DATA] Class Weights applied to penalize Idle-spamming: {self.class_weights.cpu().numpy().round(2)}")
+        # --- CLASS WEIGHTING REMOVED ---
+        # We allow the model to learn the natural distribution of the expert data.
+        print(f"[DATA] Class weighting disabled. Learning natural action frequencies.")
 
     def __len__(self):
         return len(self.clean_data)
@@ -141,8 +145,10 @@ def train():
     # Added Weight Decay (L2 Regularization) to heavily penalize memorization
     optimizer = optim.Adam(model.parameters(), lr=LR, weight_decay=1e-4)
 
-    # Label Smoothing prevents the model from becoming over-confident on ambiguous frames.
-    criterion = nn.CrossEntropyLoss(weight=train_dataset.class_weights, label_smoothing=0.15)
+    # WE REMOVED PyTorch's built-in label_smoothing!
+    # It blindly assigns probability to blocked (-1e8) actions, which caused the 400,000+ Loss explosion.
+    # Our custom soft-targets from the Lidar sweep act as a mathematically safe label smoothing.
+    criterion = nn.CrossEntropyLoss()
 
     print(f"\n--- STARTING BEHAVIORAL CLONING ({train_size} Train | {val_size} Val) ---")
 

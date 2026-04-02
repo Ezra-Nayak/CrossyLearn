@@ -202,7 +202,7 @@ class AlgorithmicExpert:
                 del self.lilypad_memory[k]
 
             # 4. Fill Grid Gaps
-            min_z, max_z = int(player_z) - 5, int(player_z) + 14
+            min_z, max_z = int(player_z) - 5, int(player_z) + 30
             for tz in range(min_z, max_z):
                 if tz not in terrain_map:
                     terrain_map[tz] = "GRASS"
@@ -245,7 +245,7 @@ class AlgorithmicExpert:
         """
         import heapq
 
-        MAX_DEPTH = 7
+        MAX_DEPTH = 10
         DT = 0.1
 
         BOUND_LEFT = -4.5
@@ -440,9 +440,31 @@ def main():
                 safety_vector = [0.0, 0.0, 0.0, 1.0]  # Default to IDLE being safe
                 terrain_map, entities = bot.poll_world_state(player_x, player_z)
                 if terrain_map or entities:
+                    current_terrain = terrain_map.get(round(player_z), "GRASS")
                     terrain_ahead = terrain_map.get(round(player_z + 1), "GRASS")
+
+                    # Always calculate true logic first to populate the Lidar safe_dict
                     action, safe_dict = bot.calculate_perfect_action(player_x, player_z, action_mask, terrain_map,
                                                                      entities)
+
+                    # --- ROAD MASTERY DATASET OVERRIDE ---
+                    # To isolate training strictly to road/car navigation, we intentionally drown
+                    # the moment we are near a river by weaponizing the safe_dict against itself.
+                    if current_terrain == "RIVER" or terrain_ahead == "RIVER":
+                        if action_mask[ACTION_UP] >= -1.0 and not safe_dict[ACTION_UP]:
+                            action = ACTION_UP  # Up is pure water. Plunge in!
+                        elif current_terrain == "RIVER":
+                            # We are on a log/lilypad. Jump off the side!
+                            if action_mask[ACTION_LEFT] >= -1.0 and not safe_dict[ACTION_LEFT]:
+                                action = ACTION_LEFT
+                            elif action_mask[ACTION_RIGHT] >= -1.0 and not safe_dict[ACTION_RIGHT]:
+                                action = ACTION_RIGHT
+                            else:
+                                action = ACTION_IDLE  # Huge log. Let it carry us off-screen to our doom.
+
+                        # Overwrite Lidar directions as entirely unsafe so the BC agent learns nothing from this frame
+                        safe_dict = {ACTION_UP: False, ACTION_LEFT: False, ACTION_RIGHT: False, ACTION_IDLE: False}
+
                     hazards_ahead = [e for e in entities if abs(e['z'] - (player_z + 1)) <= 0.8]
                     safety_vector = [
                         1.0 if safe_dict[ACTION_UP] else 0.0,

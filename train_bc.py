@@ -1,254 +1,170 @@
+# --- train_bc.py ---
+import os
+import glob
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
-import glob
-import os
-import numpy as np
+from torch.utils.data import Dataset, DataLoader, random_split
+from rich.console import Console
+from rich.progress import track
+from rich.table import Table
 
-from train_ppo import ActorCritic, PPO_DEVICE
+# Import the ActorCritic architecture exactly as the PPO agent sees it
+from train_ppo import ActorCritic
 
 # --- CONFIG ---
-BATCH_SIZE = 64
-EPOCHS = 50
-LR = 1e-4
+EXPERT_DATA_DIR = r"D:\python\crossy_learn\expert_run\pass"
+CHECKPOINT_DIR = "checkpoints"
+BATCH_SIZE = 256
+EPOCHS = 30
+LEARNING_RATE = 1e-4  # Keep it low to prevent overfitting/memorization
+WEIGHT_DECAY = 1e-5
 
-NOISE = 0.05
-
-DATA_DIR = r"D:\python\crossy_learn\expert_run\pass" # !!!!
+console = Console()
 
 
-class ExpertDataset(Dataset):
-    def __init__(self, files, snip_start_frames=3, snip_end_frames=10):
-        self.clean_data =[]
-        action_counts = {0: 0, 1: 0, 2: 0, 3: 0}
-        total_snipped = 0
+class CrossyExpertDataset(Dataset):
+    def __init__(self, data_dir):
+        self.samples = []
+        files = glob.glob(os.path.join(data_dir, "*.pt"))
 
-        for f in files:
-            trajectory = torch.load(f, weights_only=False)
+        console.print(f"[cyan]Found {len(files)} expert trajectories. Loading...[/cyan]")
 
-            # --- TRAJECTORY TRIMMING ---
-            # The RAM Bot environment already waits for UI to clear during reset.
-            # We only snip the first 5 frames (camera settling) and last 3 frames (imminent collision state).
-            if len(trajectory) <= (snip_start_frames + snip_end_frames) + 5:
-                total_snipped += len(trajectory)
-                continue  # Skip runs that are too short to be meaningful
+        for file in files:
+            try:
+                trajectory = torch.load(file, weights_only=False)
+                for step in trajectory:
+                    # SOTA DATA FILTERING:
+                    # In record_runs_ram_expert.py, we set safety to [0,0,0,0] for river hazards.
+                    # We skip these so the BC agent ONLY learns Road/Traffic mastery!
+                    if sum(step['safety']) == 0.0:
+                        continue
 
-            trimmed_trajectory = trajectory[snip_start_frames: -snip_end_frames]
-            total_snipped += (len(trajectory) - len(trimmed_trajectory))
+                    self.samples.append(step)
+            except Exception as e:
+                console.print(f"[red]Error loading {file}: {e}[/red]")
 
-            for item in trimmed_trajectory:
-                lat = torch.FloatTensor(item['latents'])
-                sca = torch.FloatTensor(item['scalars'])
-                mask = torch.FloatTensor(item['mask'])
-                act = int(item['action'])
-
-                # --- DATA CLEANING ---
-                # Force label to IDLE if a blocked key was somehow recorded
-                if mask[act] < -1:
-                    act = 3 if mask[3] == 0 else 0
-
-                # --- SOFT TARGET LIDAR LABELS ---
-                safety = item.get('safety', None)
-                target_prob = torch.zeros(4)
-
-                if safety is not None:
-                    # Filter safety by mask (ignore directions blocked by trees/walls)
-                    valid_mask = (mask >= -1.0).float()
-                    safety_t = torch.FloatTensor(safety) * valid_mask
-
-                    # Ensure the expert's chosen action is always considered safe
-                    safety_t[act] = 1.0
-
-                    safe_count = safety_t.sum().item()
-                    if safe_count > 1:
-                        # Distribute 30% probability across all safe alternative actions
-                        # This teaches the AI "This was the best move, but these were also okay."
-                        target_prob = safety_t * (0.3 / (safe_count - 1))
-                        target_prob[act] = 0.7
-                    else:
-                        # Only one safe action exists
-                        target_prob[act] = 1.0
-                else:
-                    # Fallback for any frames missing lidar data:
-                    # Apply manual smoothing only to non-blocked actions
-                    valid_mask = (mask >= -1.0).float()
-                    valid_count = valid_mask.sum().item()
-                    if valid_count > 1:
-                        target_prob = valid_mask * (0.15 / (valid_count - 1))
-                        target_prob[act] = 0.85
-                    else:
-                        target_prob[act] = 1.0
-
-                self.clean_data.append((lat, sca, mask, target_prob, act))
-                action_counts[act] += 1
-
-        print(f"[DATA] Loaded {len(files)} runs. Snipped {total_snipped} edge frames.")
-        print(f"[DATA] Clean samples: {len(self.clean_data)}")
-        print(
-            f"[DATA] Action Distribution -> Up: {action_counts[0]}, Left: {action_counts[1]}, Right: {action_counts[2]}, Idle: {action_counts[3]}")
-
-        # --- CLASS WEIGHTING REMOVED ---
-        # We allow the model to learn the natural distribution of the expert data.
-        print(f"[DATA] Class weighting disabled. Learning natural action frequencies.")
+        console.print(f"[bold green]Successfully loaded {len(self.samples)} perfect road/vehicle frames![/bold green]")
 
     def __len__(self):
-        return len(self.clean_data)
+        return len(self.samples)
 
     def __getitem__(self, idx):
-        return self.clean_data[idx]
+        s = self.samples[idx]
+
+        latents = torch.FloatTensor(s['latents'])
+        scalars = torch.FloatTensor(s['scalars'])
+        mask = torch.FloatTensor(s['mask'])
+        action = torch.tensor(s['action'], dtype=torch.long)
+
+        return latents, scalars, mask, action
 
 
-def get_next_checkpoint_name():
-    checkpoints = glob.glob("checkpoints/ppo_crossy_*.pth")
-    if not checkpoints:
-        return "checkpoints/ppo_crossy_1.pth"
-    latest_num = max([int(x.split('_')[-1].split('.')[0]) for x in checkpoints])
-    return f"checkpoints/ppo_crossy_{latest_num + 1}.pth"
+def train_behavioral_cloning():
+    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    console.print(f"[bold magenta]Starting Behavioral Cloning (Imitation Learning) on {device}[/bold magenta]")
 
-def train():
-    os.makedirs("checkpoints", exist_ok=True)
+    # 1. Prepare Data
+    full_dataset = CrossyExpertDataset(EXPERT_DATA_DIR)
 
-    # --- TRAIN / VALIDATION SPLIT (BY FILE) ---
-    # Prevents "Temporal Leakage" where adjacent frames are split between Train and Val.
-    all_files = glob.glob(os.path.join(DATA_DIR, "*.pt"))
-    np.random.shuffle(all_files)
-
-    split_idx = int(0.85 * len(all_files))
-    train_files = all_files[:split_idx]
-    val_files = all_files[split_idx:]
-
-    if not all_files:
-        print("[ERROR] No expert data found. Run record_expert.py first!")
+    if len(full_dataset) == 0:
+        console.print("[bold red]No valid data found! Run the expert recorder first.[/bold red]")
         return
 
-    train_dataset = ExpertDataset(train_files)
-    val_dataset = ExpertDataset(val_files)
+    # 90/10 Split to monitor for overfitting
+    train_size = int(0.9 * len(full_dataset))
+    val_size = len(full_dataset) - train_size
+    train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size])
 
-    train_size = len(train_dataset)
-    val_size = len(val_dataset)
-
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
     val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
 
-    model = ActorCritic(action_dim=4).to(PPO_DEVICE)
-
-    checkpoints = glob.glob("checkpoints/ppo_crossy_*.pth")
-    if checkpoints:
-        latest_cp = max(checkpoints, key=lambda x: int(x.split('_')[-1].split('.')[0]))
-        model.load_state_dict(torch.load(latest_cp, map_location=PPO_DEVICE, weights_only=False))
-        print(f"[LOAD] Fine-tuning existing brain: {latest_cp}")
-    else:
-        print("[LOAD] Starting with a fresh brain.")
-
-    # Added Weight Decay (L2 Regularization) to heavily penalize memorization
-    optimizer = optim.Adam(model.parameters(), lr=LR, weight_decay=1e-4)
-
-    # WE REMOVED PyTorch's built-in label_smoothing!
-    # It blindly assigns probability to blocked (-1e8) actions, which caused the 400,000+ Loss explosion.
-    # Our custom soft-targets from the Lidar sweep act as a mathematically safe label smoothing.
+    # 2. Initialize Model (Action Dim = 4)
+    model = ActorCritic(action_dim=4).to(device)
+    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
     criterion = nn.CrossEntropyLoss()
 
-    print(f"\n--- STARTING BEHAVIORAL CLONING ({train_size} Train | {val_size} Val) ---")
+    best_val_acc = 0.0
 
-    best_val_loss = float('inf')
-    best_model_state = None
-
+    # 3. Training Loop
     for epoch in range(1, EPOCHS + 1):
         model.train()
-        total_train_loss = 0
+        total_loss = 0.0
         correct_train = 0
+        total_train = 0
 
-        for lat, sca, mask, target_prob, act in train_loader:
-            lat, sca, mask, target_prob, act = lat.to(PPO_DEVICE), sca.to(PPO_DEVICE), mask.to(
-                PPO_DEVICE), target_prob.to(PPO_DEVICE), act.to(PPO_DEVICE)
-
-            # --- DATA AUGMENTATION (Latent Noise) ---
-            # Inject 5% Gaussian noise into the latent space.
-            # This acts as a heavy regularizer to completely obliterate memorization.
-            noise = torch.randn_like(lat) * NOISE
-            lat = lat + noise
-
-            # --- DATA AUGMENTATION (Horizontal Flip) ---
-            # 50% chance to flip the screen and swap Left/Right actions
-            if torch.rand(1).item() > 0.5:
-                # Latents shape is[B, 128, 20, 20]. Flip the width dimension (dim=3).
-                lat = torch.flip(lat, dims=[3])
-
-                # CRITICAL FIX: Invert the scalar X coordinate!
-                # If the screen flips, a chicken on the left (-X) is now on the right (+X).
-                sca = -sca
-
-                # Swap mask limits for Left (1) and Right (2)
-                mask = mask[:, [0, 2, 1, 3]]
-
-                # Swap the soft probability distributions for Left and Right
-                target_prob = target_prob[:, [0, 2, 1, 3]]
-
-                # Swap human actions (for accuracy metrics)
-                act_flipped = act.clone()
-                act_flipped[act == 1] = 2
-                act_flipped[act == 2] = 1
-                act = act_flipped
-
-            features = model._get_features(lat, sca)
-            logits = model.actor(features)
-
-            logits = logits + mask
-            loss = criterion(logits, target_prob)  # Use soft labels instead of hard index
+        # We don't need the whole loop tracked, just a standard progress indicator
+        for latents, scalars, masks, actions in train_loader:
+            latents, scalars, masks, actions = latents.to(device), scalars.to(device), masks.to(device), actions.to(
+                device)
 
             optimizer.zero_grad()
+
+            # Forward pass exactly as it occurs in PPO evaluation
+            features = model._get_features(latents, scalars)
+            action_logits = model.actor(features)
+
+            # Apply Action Masking so it doesn't get penalized for ignoring masked directions
+            masked_logits = action_logits + masks
+
+            loss = criterion(masked_logits, actions)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
             optimizer.step()
 
-            total_train_loss += loss.item()
-            predictions = torch.argmax(logits, dim=1)
-            correct_train += (predictions == act).sum().item()
+            total_loss += loss.item()
 
-        # --- VALIDATION LOOP ---
+            # Calculate accuracy
+            _, predicted = torch.max(masked_logits, 1)
+            total_train += actions.size(0)
+            correct_train += (predicted == actions).sum().item()
+
+        train_acc = 100 * correct_train / total_train
+
+        # 4. Validation Loop
         model.eval()
-        total_val_loss = 0
         correct_val = 0
+        total_val = 0
+        val_loss = 0.0
 
         with torch.no_grad():
-            for lat, sca, mask, target_prob, act in val_loader:
-                lat, sca, mask, target_prob, act = lat.to(PPO_DEVICE), sca.to(PPO_DEVICE), mask.to(
-                    PPO_DEVICE), target_prob.to(PPO_DEVICE), act.to(PPO_DEVICE)
+            for latents, scalars, masks, actions in val_loader:
+                latents, scalars, masks, actions = latents.to(device), scalars.to(device), masks.to(device), actions.to(
+                    device)
 
-                # No augmentation during validation
-                features = model._get_features(lat, sca)
-                logits = model.actor(features)
-                logits = logits + mask
+                features = model._get_features(latents, scalars)
+                masked_logits = model.actor(features) + masks
 
-                loss = criterion(logits, target_prob)  # Soft validation loss
-                total_val_loss += loss.item()
+                loss = criterion(masked_logits, actions)
+                val_loss += loss.item()
 
-                predictions = torch.argmax(logits, dim=1)
-                correct_val += (predictions == act).sum().item()
+                _, predicted = torch.max(masked_logits, 1)
+                total_val += actions.size(0)
+                correct_val += (predicted == actions).sum().item()
 
-        avg_train_loss = total_train_loss / len(train_loader)
-        train_acc = (correct_train / train_size) * 100
+        val_acc = 100 * correct_val / total_val
+        avg_train_loss = total_loss / len(train_loader)
+        avg_val_loss = val_loss / len(val_loader)
 
-        avg_val_loss = total_val_loss / len(val_loader)
-        val_acc = (correct_val / val_size) * 100
+        console.print(f"Epoch [bold cyan]{epoch:02d}/{EPOCHS}[/bold cyan] | "
+                      f"Train Loss: {avg_train_loss:.4f} | Train Acc: [green]{train_acc:.1f}%[/green] | "
+                      f"Val Loss: {avg_val_loss:.4f} | Val Acc: [bold green]{val_acc:.1f}%[/bold green]")
 
-        print(
-            f"Epoch {epoch:02d}/{EPOCHS} | Train Loss: {avg_train_loss:.4f} ({train_acc:.1f}%) | Val Loss: {avg_val_loss:.4f} ({val_acc:.1f}%)")
+        # 5. Save Model Checkpoint
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
 
-        # Early Stopping Check
-        if avg_val_loss < best_val_loss:
-            best_val_loss = avg_val_loss
-            best_model_state = model.state_dict()
+            # We save this specifically as 'ppo_crossy_0.pth'.
+            # In your train_ppo.py, any checkpoint index < 10 triggers the `is_bc_resume` logic!
+            save_path = os.path.join(CHECKPOINT_DIR, "ppo_crossy_0.pth")
+            torch.save(model.state_dict(), save_path)
+            console.print(f"  [yellow]-> New best model saved to {save_path}[/yellow]")
 
-    save_path = get_next_checkpoint_name()
-    # Save the BEST validation model, not the final overfit one
-    torch.save(best_model_state, save_path)
-
-    print(f"\n[SUCCESS] Saved BEST model (Val Loss: {best_val_loss:.4f}) to {save_path}")
-    print("[INFO] train_ppo.py will automatically resume from here and generate the Critic values.")
+    console.print("[bold magenta]Behavioral Cloning Complete![/bold magenta]")
+    console.print(
+        "You can now run [bold]train_ppo.py[/bold]. The PPO agent will load 'ppo_crossy_0.pth', freeze the Actor, and warm up the Critic!")
 
 
 if __name__ == "__main__":
-    train()
+    train_behavioral_cloning()

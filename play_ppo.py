@@ -8,7 +8,7 @@ import cv2
 from train_ppo import CrossyGameEnv, ActorCritic, PPO_DEVICE
 
 # --- CONFIG ---
-CHECKPOINT_PATH = "imp_backups/ppo_crossy_3700.pth"
+CHECKPOINT_PATH = "checkpoints/ppo_crossy_0.pth"
 
 
 def play():
